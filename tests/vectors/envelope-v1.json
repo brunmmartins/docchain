@@ -1,0 +1,94 @@
+{
+  "id": "envelope-v1-design",
+  "purpose": "Normative invented-data-only conformance vector for the Docchain version 1 envelope.",
+  "inputs": {
+    "registry_authority_ed25519_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "sender_ed25519_seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "sender_x25519_ikm_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "recipient_x25519_ikm_hex": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+    "sender_hpke_ephemeral_ikm_hex": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "recipient_hpke_ephemeral_ikm_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+    "content_key_hex": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "content_nonce_hex": "e0e1e2e3e4e5e6e7e8e9eaeb",
+    "request_nonce_hex": "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+    "document_id": "doc_0000000000000001",
+    "document_version": 1,
+    "sender_wallet_id": "wal_0000000000000001",
+    "recipient_wallet_id": "wal_0000000000000002"
+  },
+  "expected": {
+    "schema_bytes": "{\"$id\":\"urn:docchain:schema:service-application:1.0.0\",\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"additionalProperties\":false,\"properties\":{\"applicationReference\":{\"pattern\":\"^SYN-[A-Z0-9]{6,24}$\",\"type\":\"string\"},\"declarations\":{\"items\":{\"enum\":[\"invented-data-only\",\"no-legal-effect\"],\"type\":\"string\"},\"maxItems\":10,\"type\":\"array\",\"uniqueItems\":true},\"serviceCode\":{\"enum\":[\"synthetic-record-copy\"],\"type\":\"string\"},\"statement\":{\"maxLength\":2000,\"minLength\":1,\"type\":\"string\"},\"submittedOn\":{\"format\":\"date\",\"type\":\"string\"}},\"required\":[\"applicationReference\",\"serviceCode\",\"submittedOn\",\"statement\",\"declarations\"],\"title\":\"Synthetic service application\",\"type\":\"object\"}",
+    "schema_digest": "R5tccghGwMBepepzzhm7ZPwrKdqplZn2uC189faYvYY",
+    "document_bytes": "{\"applicationReference\":\"SYN-APP0001\",\"declarations\":[\"invented-data-only\",\"no-legal-effect\"],\"serviceCode\":\"synthetic-record-copy\",\"statement\":\"Please provide the invented record used by the Docchain demonstration.\",\"submittedOn\":\"2026-09-19\"}",
+    "document_digest": "R7J8jCVRf2ekLeSxpzU5hXotek_Pef3UjGj_fHI-ZaQ",
+    "registry_public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+    "registry_key_id": "reg-ed25519-Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw",
+    "sender_public_key": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc",
+    "sender_key_id": "sig-ed25519-JPbtasv-EAnAMNfKVnwzykgwkRSYI2tVYabIKr7F3ig",
+    "encryption_public_keys": [
+      "sln27pLcugERhQsTs_bczIJ3JvmwgjWrYpIraz8_Khk",
+      "utdi4JhEbLzFizDH6AT4KEe4uREYWZZYKvnye_1Oh18"
+    ],
+    "encryption_key_ids": [
+      "kem-x25519-2N75snd6-zKUUkrlldIKhdTGDJeNDMKF_knhwUKbxLs",
+      "kem-x25519-MJEVQM_yguYS9Yb3lGJfNCgI4P6ZbfFFgiISGzfabjg"
+    ],
+    "binding_records": [
+      "{\"body\":{\"algorithm\":\"Ed25519\",\"authority_key_id\":\"reg-ed25519-Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw\",\"key_id\":\"sig-ed25519-JPbtasv-EAnAMNfKVnwzykgwkRSYI2tVYabIKr7F3ig\",\"not_before\":\"2026-09-19T00:00:00Z\",\"public_key\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\",\"purpose\":\"document-signing\",\"registry_sequence\":1,\"state\":\"active\",\"wallet_id\":\"wal_0000000000000001\"},\"signature\":\"qKMoc13fq2tMDkW1hlMP6ssm0u8GVevUo9BLYmOEYqkAXqUUQX8BM7-SmvfTIs7pzhuh3xmuvPhsW7-zfXFOBw\"}",
+      "{\"body\":{\"algorithm\":\"X25519\",\"authority_key_id\":\"reg-ed25519-Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw\",\"key_id\":\"kem-x25519-2N75snd6-zKUUkrlldIKhdTGDJeNDMKF_knhwUKbxLs\",\"not_before\":\"2026-09-19T00:00:00Z\",\"public_key\":\"sln27pLcugERhQsTs_bczIJ3JvmwgjWrYpIraz8_Khk\",\"purpose\":\"document-encryption\",\"registry_sequence\":2,\"state\":\"active\",\"wallet_id\":\"wal_0000000000000001\"},\"signature\":\"sNUtiw8YHgaTItBuuyhoMehKQDWiLHYoCp3zVyi-ndVUGXJGuM8M9YV_aD8RwnZps4cINHBZN1Jb1E8x3RQMAw\"}",
+      "{\"body\":{\"algorithm\":\"X25519\",\"authority_key_id\":\"reg-ed25519-Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw\",\"key_id\":\"kem-x25519-MJEVQM_yguYS9Yb3lGJfNCgI4P6ZbfFFgiISGzfabjg\",\"not_before\":\"2026-09-19T00:00:00Z\",\"public_key\":\"utdi4JhEbLzFizDH6AT4KEe4uREYWZZYKvnye_1Oh18\",\"purpose\":\"document-encryption\",\"registry_sequence\":3,\"state\":\"active\",\"wallet_id\":\"wal_0000000000000002\"},\"signature\":\"8FzgyaMbCCKEZ8pNneMtDxBs402sP7HgGOisrD5Us-1k9tE8Zmtzqu45QYNbSl6tl3qT8bsT85y8icw3YAE0Bg\"}"
+    ],
+    "binding_digests": [
+      "YIQjxw1FoVmcfctxUTy_I_g1DTvkeaXoA0-XqlKIXxA",
+      "0WejQt77M7UEGaEarIy6U0kzi3nHZzfFz4qrI2beg2w",
+      "UTCxOJflyJeuZmVrzKkGfRY6_fHSx2N3W_u68DbPSZ8"
+    ],
+    "signature_input": "ZG9jY2hhaW4vZW52ZWxvcGUvdjEvc2lnbmF0dXJlALbNNg-LmhxX59S5SXCDgK9nH991fWY7HFNEYCDRyHBrR7J8jCVRf2ekLeSxpzU5hXotek_Pef3UjGj_fHI-ZaQ",
+    "protected_hash": "ts02D4uaHFfn1LlJcIOAr2cf33V9ZjscU0RgINHIcGs",
+    "signature": "qsIE3b7swbg8DqfcbYUbkrY5aS2fFWF4ME256UblAeij3ddE7Nq6-yLqnl4AZ0lQDIH7AA5gB3q8utjO6hoYAQ",
+    "payload": "RENQMQAAAPR7ImFwcGxpY2F0aW9uUmVmZXJlbmNlIjoiU1lOLUFQUDAwMDEiLCJkZWNsYXJhdGlvbnMiOlsiaW52ZW50ZWQtZGF0YS1vbmx5Iiwibm8tbGVnYWwtZWZmZWN0Il0sInNlcnZpY2VDb2RlIjoic3ludGhldGljLXJlY29yZC1jb3B5Iiwic3RhdGVtZW50IjoiUGxlYXNlIHByb3ZpZGUgdGhlIGludmVudGVkIHJlY29yZCB1c2VkIGJ5IHRoZSBEb2NjaGFpbiBkZW1vbnN0cmF0aW9uLiIsInN1Ym1pdHRlZE9uIjoiMjAyNi0wOS0xOSJ9R7J8jCVRf2ekLeSxpzU5hXotek_Pef3UjGj_fHI-ZaSqwgTdvuzBuDwOp9xthRuStjlpLZ8VYXgwTbnpRuUB6KPd10Ts2rr7IuqeXgBnSVAMgfsADmAHery62M7qGhgB",
+    "content_aad": "ZG9jY2hhaW4vZW52ZWxvcGUvdjEvY29udGVudC1hYWQAts02D4uaHFfn1LlJcIOAr2cf33V9ZjscU0RgINHIcGs",
+    "content_ciphertext": "73HtOyYG7lbYgRWd9NwfE2lG-TT9bu3dNfnCcjO6jGjPWop5SucZ8vSSvSpF8NcmJ1XMVKC5Q3Mr2wwhjUwWk-gOJjUPEruJYZSHoJmj7qnU2xa-_bCxMQI2_OZuseYCSn9luhC6d3VU_UVanHYVn8nepcoavqbaEX7Ycbx-79onk61DpewZZAauihayUEQ3Pn-aM5fruaJ7wxZEAmNF3O_LqGoq8HaqjnsWHNa4hZ9br2nsOA54td119qD-dADmXRYH2XZqJ_J2v91PtLTjz49X50lvAYNu7C469vSwBmeHulsgMNAicI_yWgN2EmKiWxa5_jUEWyoxP6hlcrMXdtID_IpnHL6c0aySTwTcGWfaRWxybex5t4NwBE_IBmUAPUWRkurnMdSVp9CRwzm7aaoIgYSwX-i08FgGbnSH1wQnL5QNPUgsf_5mrzV3OH2CIz4M9GOlw1_dKzCSBF9Ku2loV0-IjrPEZzNZKA",
+    "hpke_info": "ZG9jY2hhaW4vZW52ZWxvcGUvdjEvaHBrZS1pbmZvALbNNg-LmhxX59S5SXCDgK9nH991fWY7HFNEYCDRyHBr",
+    "recipient_descriptors": [
+      "{\"binding_digest\":\"0WejQt77M7UEGaEarIy6U0kzi3nHZzfFz4qrI2beg2w\",\"encryption_key_id\":\"kem-x25519-2N75snd6-zKUUkrlldIKhdTGDJeNDMKF_knhwUKbxLs\",\"wallet_id\":\"wal_0000000000000001\"}",
+      "{\"binding_digest\":\"UTCxOJflyJeuZmVrzKkGfRY6_fHSx2N3W_u68DbPSZ8\",\"encryption_key_id\":\"kem-x25519-MJEVQM_yguYS9Yb3lGJfNCgI4P6ZbfFFgiISGzfabjg\",\"wallet_id\":\"wal_0000000000000002\"}"
+    ],
+    "hpke_aads": [
+      "ZG9jY2hhaW4vZW52ZWxvcGUvdjEvaHBrZS1hYWQAts02D4uaHFfn1LlJcIOAr2cf33V9ZjscU0RgINHIcGsZj32falguzxRaDPnGo1uEBXS4NBGmfArCG_1onpafJw",
+      "ZG9jY2hhaW4vZW52ZWxvcGUvdjEvaHBrZS1hYWQAts02D4uaHFfn1LlJcIOAr2cf33V9ZjscU0RgINHIcGuhJhyA8N9tEtp0FtgVyDi5_cfH5EMl6SvFzqrlUwiikw"
+    ],
+    "encapsulated_keys": [
+      "evA98Vni11dRwaiOtanoeYjxONznWW69o61_C7BKhzQ",
+      "EEXh6QK3jX90xmhxawIr1RM3jVUqUm1lM-8W4oZ0nD0"
+    ],
+    "wrapped_keys": [
+      "26TeqXG4dnTMYCM6H2IMM1hwteczaRNAFZNhUW-bO4C_3Lr3nMgnzMkPMtbiO-iD",
+      "AF41z16AXK1WglNBHkaSancZiZaEWD_W7MLs8_R72MzLrP8VT0GQDGRFwIEwFA1o"
+    ],
+    "commitment": "hpHAANBEuwNGuv2W-CM900MOraVdhd2lTGiMFk2_Upc",
+    "protected_bytes": "{\"algorithms\":{\"canonicalization\":\"RFC8785\",\"content_aead\":\"ChaCha20Poly1305\",\"digest\":\"SHA-256\",\"hpke_aead_id\":3,\"hpke_kdf_id\":1,\"hpke_kem_id\":32,\"hpke_mode\":0,\"signature\":\"Ed25519\"},\"content_nonce\":\"4OHi4-Tl5ufo6err\",\"document_id\":\"doc_0000000000000001\",\"document_version\":1,\"envelope_version\":1,\"operation\":\"send-copy\",\"recipients\":[{\"binding_digest\":\"0WejQt77M7UEGaEarIy6U0kzi3nHZzfFz4qrI2beg2w\",\"encryption_key_id\":\"kem-x25519-2N75snd6-zKUUkrlldIKhdTGDJeNDMKF_knhwUKbxLs\",\"wallet_id\":\"wal_0000000000000001\"},{\"binding_digest\":\"UTCxOJflyJeuZmVrzKkGfRY6_fHSx2N3W_u68DbPSZ8\",\"encryption_key_id\":\"kem-x25519-MJEVQM_yguYS9Yb3lGJfNCgI4P6ZbfFFgiISGzfabjg\",\"wallet_id\":\"wal_0000000000000002\"}],\"request_nonce\":\"8PHy8_T19vf4-fr7_P3-_w\",\"schema_digest\":\"R5tccghGwMBepepzzhm7ZPwrKdqplZn2uC189faYvYY\",\"schema_id\":\"urn:docchain:schema:service-application:1.0.0\",\"sender\":{\"binding_digest\":\"YIQjxw1FoVmcfctxUTy_I_g1DTvkeaXoA0-XqlKIXxA\",\"signing_key_id\":\"sig-ed25519-JPbtasv-EAnAMNfKVnwzykgwkRSYI2tVYabIKr7F3ig\",\"wallet_id\":\"wal_0000000000000001\"}}",
+    "envelope_bytes": "{\"ciphertext\":\"73HtOyYG7lbYgRWd9NwfE2lG-TT9bu3dNfnCcjO6jGjPWop5SucZ8vSSvSpF8NcmJ1XMVKC5Q3Mr2wwhjUwWk-gOJjUPEruJYZSHoJmj7qnU2xa-_bCxMQI2_OZuseYCSn9luhC6d3VU_UVanHYVn8nepcoavqbaEX7Ycbx-79onk61DpewZZAauihayUEQ3Pn-aM5fruaJ7wxZEAmNF3O_LqGoq8HaqjnsWHNa4hZ9br2nsOA54td119qD-dADmXRYH2XZqJ_J2v91PtLTjz49X50lvAYNu7C469vSwBmeHulsgMNAicI_yWgN2EmKiWxa5_jUEWyoxP6hlcrMXdtID_IpnHL6c0aySTwTcGWfaRWxybex5t4NwBE_IBmUAPUWRkurnMdSVp9CRwzm7aaoIgYSwX-i08FgGbnSH1wQnL5QNPUgsf_5mrzV3OH2CIz4M9GOlw1_dKzCSBF9Ku2loV0-IjrPEZzNZKA\",\"protected\":\"eyJhbGdvcml0aG1zIjp7ImNhbm9uaWNhbGl6YXRpb24iOiJSRkM4Nzg1IiwiY29udGVudF9hZWFkIjoiQ2hhQ2hhMjBQb2x5MTMwNSIsImRpZ2VzdCI6IlNIQS0yNTYiLCJocGtlX2FlYWRfaWQiOjMsImhwa2Vfa2RmX2lkIjoxLCJocGtlX2tlbV9pZCI6MzIsImhwa2VfbW9kZSI6MCwic2lnbmF0dXJlIjoiRWQyNTUxOSJ9LCJjb250ZW50X25vbmNlIjoiNE9IaTQtVGw1dWZvNmVyciIsImRvY3VtZW50X2lkIjoiZG9jXzAwMDAwMDAwMDAwMDAwMDEiLCJkb2N1bWVudF92ZXJzaW9uIjoxLCJlbnZlbG9wZV92ZXJzaW9uIjoxLCJvcGVyYXRpb24iOiJzZW5kLWNvcHkiLCJyZWNpcGllbnRzIjpbeyJiaW5kaW5nX2RpZ2VzdCI6IjBXZWpRdDc3TTdVRUdhRWFySXk2VTBremkzbkhaemZGejRxckkyYmVnMnciLCJlbmNyeXB0aW9uX2tleV9pZCI6ImtlbS14MjU1MTktMk43NXNuZDYtektVVWtybGxkSUtoZFRHREplTkRNS0Zfa25od1VLYnhMcyIsIndhbGxldF9pZCI6IndhbF8wMDAwMDAwMDAwMDAwMDAxIn0seyJiaW5kaW5nX2RpZ2VzdCI6IlVUQ3hPSmZseUpldVptVnJ6S2tHZlJZNl9mSFN4Mk4zV191NjhEYlBTWjgiLCJlbmNyeXB0aW9uX2tleV9pZCI6ImtlbS14MjU1MTktTUpFVlFNX3lndVlTOVliM2xHSmZOQ2dJNFA2WmJmRkZnaUlTR3pmYWJqZyIsIndhbGxldF9pZCI6IndhbF8wMDAwMDAwMDAwMDAwMDAyIn1dLCJyZXF1ZXN0X25vbmNlIjoiOFBIeThfVDE5dmY0LWZyN19QMy1fdyIsInNjaGVtYV9kaWdlc3QiOiJSNXRjY2doR3dNQmVwZXB6emhtN1pQd3JLZHFwbFpuMnVDMTg5ZmFZdllZIiwic2NoZW1hX2lkIjoidXJuOmRvY2NoYWluOnNjaGVtYTpzZXJ2aWNlLWFwcGxpY2F0aW9uOjEuMC4wIiwic2VuZGVyIjp7ImJpbmRpbmdfZGlnZXN0IjoiWUlRanh3MUZvVm1jZmN0eFVUeV9JX2cxRFR2a2VhWG9BMC1YcWxLSVh4QSIsInNpZ25pbmdfa2V5X2lkIjoic2lnLWVkMjU1MTktSlBidGFzdi1FQW5BTU5mS1Zud3p5a2d3a1JTWUkydFZZYWJJS3I3RjNpZyIsIndhbGxldF9pZCI6IndhbF8wMDAwMDAwMDAwMDAwMDAxIn19\",\"recipients\":[{\"enc\":\"evA98Vni11dRwaiOtanoeYjxONznWW69o61_C7BKhzQ\",\"wrapped_key\":\"26TeqXG4dnTMYCM6H2IMM1hwteczaRNAFZNhUW-bO4C_3Lr3nMgnzMkPMtbiO-iD\"},{\"enc\":\"EEXh6QK3jX90xmhxawIr1RM3jVUqUm1lM-8W4oZ0nD0\",\"wrapped_key\":\"AF41z16AXK1WglNBHkaSancZiZaEWD_W7MLs8_R72MzLrP8VT0GQDGRFwIEwFA1o\"}]}"
+  },
+  "negative_mutations": [
+    {"id":"N01","mutation":"duplicate top-level statement member","rejection_stage":"strict parse before schema validation"},
+    {"id":"N02","mutation":"fractional number, invalid UTF-8, or lone surrogate","rejection_stage":"strict profile before schema validation"},
+    {"id":"N03","mutation":"schema digest, schema-invalid document, size, or depth","rejection_stage":"before encryption or commit"},
+    {"id":"N04","mutation":"binding wallet, purpose, validity, state, key, or signature","rejection_stage":"binding validation before cryptography"},
+    {"id":"N05","mutation":"wrong key length or all-zero X25519 result","rejection_stage":"key validation before storage or plaintext"},
+    {"id":"N06","mutation":"unsupported suite or envelope version","rejection_stage":"protected-header validation without fallback"},
+    {"id":"N07","mutation":"recipient insertion, removal, reorder, or key substitution","rejection_stage":"protected-hash binding before plaintext"},
+    {"id":"N08","mutation":"content nonce, AAD, ciphertext, or tag bit flip","rejection_stage":"content opening before plaintext"},
+    {"id":"N09","mutation":"HPKE AAD, encapsulation, wrapper, or tag bit flip","rejection_stage":"recipient wrapper opening"},
+    {"id":"N10","mutation":"encrypted digest or signature bit flip","rejection_stage":"digest or signature verification before plaintext"},
+    {"id":"N11","mutation":"truncated or trailing payload byte","rejection_stage":"exact payload length before document parsing"},
+    {"id":"N12","mutation":"request nonce, idempotency key, version tuple, or acceptance replay","rejection_stage":"prior result or conflict without duplicate state"},
+    {"id":"N13","mutation":"content key, nonce, or HPKE entropy failure","rejection_stage":"before object write or event"}
+  ],
+  "component_vector_references": [
+    {"standard":"RFC 8785","location":"Appendix B and the canonicalization examples","url":"https://www.rfc-editor.org/rfc/rfc8785"},
+    {"standard":"RFC 8032","location":"Section 7.1 Ed25519 test vectors","url":"https://www.rfc-editor.org/rfc/rfc8032"},
+    {"standard":"RFC 8439","location":"Section 2.8.2 AEAD test vector","url":"https://www.rfc-editor.org/rfc/rfc8439"},
+    {"standard":"RFC 9180","location":"Appendix A.2 DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305, Base mode","url":"https://www.rfc-editor.org/rfc/rfc9180"}
+  ]
+}

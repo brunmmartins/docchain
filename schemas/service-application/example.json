@@ -1,0 +1,10 @@
+{
+  "applicationReference": "SYN-APP0001",
+  "serviceCode": "synthetic-record-copy",
+  "submittedOn": "2026-09-19",
+  "statement": "Please provide the invented record used by the Docchain demonstration.",
+  "declarations": [
+    "invented-data-only",
+    "no-legal-effect"
+  ]
+}

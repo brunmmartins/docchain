@@ -1,0 +1,44 @@
+# Only what building, testing, and running Docchain needs is tracked: source, manifests, the lockfile,
+# lint and dependency policy, the justfile, the schemas and fixtures the code embeds, and the README,
+# contributing, security, and licence documents. Everything else below stays local.
+
+# Build output
+/target/
+
+# Local environment, secrets, and runtime data
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+/.local/
+
+# Coverage and profiling output
+/coverage/
+*.profraw
+flamegraph.svg
+
+# Tool output
+/.cache/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+
+# Local development tooling and planning records
+/.agents/
+/.claude/
+/.codex/
+/.delivery/
+/.opencode/
+/.worktrees/
+/AGENTS.md
+/CLAUDE.md
+/CHANGELOG.md
+/docs/
+/work-items/
+/contracts/
+
+# Schemas are tracked only once the code embeds them
+/schemas/*
+!/schemas/service-application/

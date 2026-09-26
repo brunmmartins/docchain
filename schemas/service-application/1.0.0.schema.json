@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:docchain:schema:service-application:1.0.0",
+  "title": "Synthetic service application",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "applicationReference",
+    "serviceCode",
+    "submittedOn",
+    "statement",
+    "declarations"
+  ],
+  "properties": {
+    "applicationReference": {
+      "type": "string",
+      "pattern": "^SYN-[A-Z0-9]{6,24}$"
+    },
+    "serviceCode": {
+      "type": "string",
+      "enum": [
+        "synthetic-record-copy"
+      ]
+    },
+    "submittedOn": {
+      "type": "string",
+      "format": "date"
+    },
+    "statement": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "declarations": {
+      "type": "array",
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "invented-data-only",
+          "no-legal-effect"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,42 @@
+# Dependency policy for Docchain, checked by `just deny`.
+#
+# Every exception carries a reason, an owner, and a removal condition. Scanner output is triaged for
+# reachability and exposure, not accepted or dismissed on its score.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # { id = "RUSTSEC-YYYY-NNNN", reason = "<why not exploitable here>; owner <name>; remove when <condition>" },
+]
+
+[licenses]
+# Widening this allow-list is a licence-policy change, not a build fix. All five are permissive.
+# BSD-3-Clause comes with the curve25519 cryptography and the HTTP router, Zlib with a hashing
+# helper, and Unicode-3.0 with almost every proc-macro dependency. Distributing a binary requires
+# shipping the BSD-3-Clause copyright notices with it.
+allow = ["Apache-2.0", "BSD-3-Clause", "MIT", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.93
+# An allowed licence that no dependency uses yet is not a finding.
+unused-allowed-license = "allow"
+exceptions = [
+    # { allow = ["<SPDX id>"], crate = "<crate>", reason = "<why>; owner <name>; remove when <condition>" },
+]
+
+[licenses.private]
+# Workspace crates are unpublished (`publish = false`), and their licence is the project's own.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies between unpublished workspace crates are not wildcard version requirements.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

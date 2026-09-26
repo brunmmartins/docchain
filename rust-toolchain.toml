@@ -1,0 +1,5 @@
+# The toolchain contributors, editors, and CI use. It is not a minimum supported Rust version.
+[toolchain]
+channel = "1.98.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,3 @@
+# `clippy::unwrap_used` is a workspace lint, but tests are where `unwrap` belongs. Exempt them here
+# rather than scattering `#[allow]` through the test suite.
+allow-unwrap-in-tests = true

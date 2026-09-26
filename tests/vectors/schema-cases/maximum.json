@@ -1,0 +1,16 @@
+[
+    {
+        "description": "maximum validation with integer instances",
+        "schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "maximum": 300
+        },
+        "tests": [
+            {
+                "description": "above the maximum is invalid",
+                "data": 301,
+                "valid": false
+            }
+        ]
+    }
+]
