@@ -7,19 +7,22 @@
 use std::fmt::Write as _;
 
 use docchain_domain::{
-    CompiledSchema, EventDraft, EventKind, ExchangeId, IdempotencyKey, ObjectId, WalletId,
-    envelope_commitment, parse_document, sha256, verify_event_chain,
+    AuditExportManifest, CompiledSchema, EventDraft, EventKind, ExchangeId, IdempotencyKey,
+    ObjectId, WalletId, envelope_commitment, event_signature_input, parse_document, sha256,
+    verify_event_chain,
 };
 
 use crate::{
-    AcceptanceResult, Actor, ApplicationError, AuditReport, Credential, Delivery, Limits,
-    Plaintext, SendCopyCommand,
+    AcceptanceResult, Actor, ApplicationError, AuditExportEvent, AuditExportPage,
+    AuditExportRequest, AuditPublicKey, AuditReport, AuditSettings, Coverage, Credential, Delivery,
+    Limits, Plaintext, SendCopyCommand,
+    model::AuditExportKind,
     ports::{
-        AcceptanceOutcome, Adapters, Clock as _, CreditPosting, CryptoError, DocumentStore as _,
-        EnvelopeCryptography as _, EventIntegrity as _, ExchangeRecord, ExchangeStore as _,
-        HeaderKey, Identity as _, IdentityError, KeyPurpose, KeyRegistry as _, KeyRegistryError,
-        OpenRequest, SchemaRegistry as _, SchemaRegistryError, SealRequest, StoreError,
-        VerifiedBinding,
+        AcceptanceOutcome, Adapters, AuditEventStore as _, AuditReadError, AuditReadRequest,
+        Clock as _, CreditPosting, CryptoError, DocumentStore as _, EnvelopeCryptography as _,
+        EventIntegrity as _, ExchangeRecord, ExchangeStore as _, HeaderKey, Identity as _,
+        IdentityError, KeyPurpose, KeyRegistry as _, KeyRegistryError, OpenRequest,
+        SchemaRegistry as _, SchemaRegistryError, SealRequest, StoreError, VerifiedBinding,
     },
 };
 
@@ -30,6 +33,7 @@ const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 pub struct Application<A: Adapters> {
     adapters: A,
     limits: Limits,
+    audit: AuditSettings,
 }
 
 struct ActiveSchema {
@@ -40,8 +44,12 @@ struct ActiveSchema {
 impl<A: Adapters> Application<A> {
     /// Builds the application over its adapters.
     #[must_use]
-    pub const fn new(adapters: A, limits: Limits) -> Self {
-        Self { adapters, limits }
+    pub const fn new(adapters: A, limits: Limits, audit: AuditSettings) -> Self {
+        Self {
+            adapters,
+            limits,
+            audit,
+        }
     }
 
     /// The adapters, for readiness checks and tests.
@@ -351,8 +359,9 @@ impl<A: Adapters> Application<A> {
 
     /// Verifies the signed event chain and every envelope commitment, without plaintext.
     ///
-    /// With `expected`, the chain must still contain that earlier head, so removing events
-    /// after it is detected.
+    /// With `expected`, the chain must still contain that earlier head, so rollback at or before
+    /// that checkpoint is detected. A first call without one establishes a baseline only: this
+    /// service holds the audit key, so its verdict cannot prove absolute freshness.
     ///
     /// # Errors
     ///
@@ -366,22 +375,55 @@ impl<A: Adapters> Application<A> {
         if *actor != Actor::Auditor {
             return Err(ApplicationError::Forbidden);
         }
-        let fetch_limit = self
-            .limits
-            .audit_events
-            .checked_add(1)
-            .ok_or(ApplicationError::Invariant)?;
-        let events = self
+        let mut stored = self
             .adapters
-            .exchanges()
-            .events(fetch_limit)
+            .audit_events()
+            .page(AuditReadRequest {
+                snapshot: None,
+                after_sequence: 0,
+                limit: 500,
+            })
             .await
-            .map_err(|error| match error {
-                StoreError::Invariant => ApplicationError::IntegrityFailure,
-                other => store_error(other),
-            })?;
-        if events.len() > self.limits.audit_events as usize {
+            .map_err(audit_read_error)?;
+        if stored.snapshot.event_count() > u64::from(self.limits.audit_events) {
             return Err(ApplicationError::AuditIncomplete);
+        }
+        let snapshot = stored.snapshot;
+        let mut after_sequence = 0;
+        let mut events = Vec::new();
+        loop {
+            // Every page must advance the cursor, so a faulty adapter cannot loop forever.
+            let has_more = stored.has_more;
+            let Some(last) = stored.events.last().map(|event| event.sequence) else {
+                if has_more {
+                    return Err(ApplicationError::IntegrityFailure);
+                }
+                break;
+            };
+            if last <= after_sequence {
+                return Err(ApplicationError::IntegrityFailure);
+            }
+            after_sequence = last;
+            events.extend(stored.events);
+            if !has_more {
+                break;
+            }
+            stored = self
+                .adapters
+                .audit_events()
+                .page(AuditReadRequest {
+                    snapshot: Some(snapshot),
+                    after_sequence,
+                    limit: 500,
+                })
+                .await
+                .map_err(audit_read_error)?;
+            if stored.snapshot != snapshot {
+                return Err(ApplicationError::IntegrityFailure);
+            }
+        }
+        if u64::try_from(events.len()).ok() != Some(snapshot.event_count()) {
+            return Err(ApplicationError::IntegrityFailure);
         }
         let integrity = self.adapters.integrity();
         let head = verify_event_chain(&events, expected.as_ref(), |input, signature| {
@@ -423,6 +465,182 @@ impl<A: Adapters> Application<A> {
         Ok(AuditReport {
             event_count: events.len(),
             head,
+        })
+    }
+
+    /// Returns the pinned public half of the audit key to an authorized auditor.
+    ///
+    /// The returned fingerprint is not a trust anchor: a verifier compares it with the value
+    /// provisioned to it separately and never adopts it from this response.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplicationError::Forbidden`] unless the actor is an auditor.
+    pub fn audit_public_key(&self, actor: &Actor) -> Result<AuditPublicKey, ApplicationError> {
+        if *actor != Actor::Auditor {
+            return Err(ApplicationError::Forbidden);
+        }
+        Ok(self.audit.public_key())
+    }
+
+    /// Selects or continues one bounded challenge-bound snapshot export.
+    ///
+    /// A start request selects the current snapshot and signs a manifest binding it to the
+    /// verifier's challenge and the pinned key fingerprint. Every page repeats that manifest
+    /// unchanged, and only the page that ends at the manifest's event count reports
+    /// [`Coverage::Complete`]. Events appended after selection are excluded.
+    ///
+    /// A verifier's first complete export is a baseline. A later export detects rollback only at
+    /// or before the newest checkpoint the verifier retained; neither proves absolute freshness
+    /// nor that the key holder showed every auditor the same snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplicationError::Forbidden`] unless the actor is an auditor, before any key or store
+    /// access; [`ApplicationError::InvalidRequest`] for a manifest that is not signed by the
+    /// pinned key; [`ApplicationError::AuditIncomplete`] for a snapshot beyond the configured
+    /// total, with no page; [`ApplicationError::IntegrityFailure`] for a changed snapshot, a
+    /// selected head whose signature fails before any manifest is signed, or a stored event that
+    /// fails its hash, link, or signature; [`ApplicationError::Unavailable`]
+    /// when the store fails.
+    pub async fn export_audit_events(
+        &self,
+        actor: &Actor,
+        request: AuditExportRequest,
+    ) -> Result<AuditExportPage, ApplicationError> {
+        if *actor != Actor::Auditor {
+            return Err(ApplicationError::Forbidden);
+        }
+        let limit = request.page_size(self.audit.default_page_size());
+        let (manifest, signature, after_sequence, stored) = match request.kind {
+            AuditExportKind::Start { challenge } => {
+                let stored = self
+                    .adapters
+                    .audit_events()
+                    .page(AuditReadRequest {
+                        snapshot: None,
+                        after_sequence: 0,
+                        limit,
+                    })
+                    .await
+                    .map_err(audit_read_error)?;
+                if stored.snapshot.event_count() > u64::from(self.audit.max_export_events()) {
+                    return Err(ApplicationError::AuditIncomplete);
+                }
+                // The store is less trusted than the key: never attest to a head the key did
+                // not sign, even when the first page stops before reaching it.
+                if let Some(head) = stored.snapshot.head()
+                    && self
+                        .adapters
+                        .integrity()
+                        .verify(&event_signature_input(&head.event_hash), &head.signature)
+                        .is_err()
+                {
+                    return Err(ApplicationError::IntegrityFailure);
+                }
+                let manifest = AuditExportManifest::new(
+                    challenge,
+                    self.audit.public_key().fingerprint().as_bytes(),
+                    stored.snapshot,
+                );
+                let signature = self
+                    .adapters
+                    .integrity()
+                    .sign(&manifest.signature_input_v1())
+                    .map_err(|_| ApplicationError::Invariant)?;
+                (manifest, signature, 0, stored)
+            }
+            AuditExportKind::Continue {
+                manifest,
+                manifest_signature,
+                after_sequence,
+            } => {
+                let manifest = *manifest;
+                if manifest.audit_key_fingerprint()
+                    != self.audit.public_key().fingerprint().as_bytes()
+                    || self
+                        .adapters
+                        .integrity()
+                        .verify(&manifest.signature_input_v1(), &manifest_signature)
+                        .is_err()
+                {
+                    return Err(ApplicationError::InvalidRequest);
+                }
+                if manifest.snapshot().event_count() > u64::from(self.audit.max_export_events()) {
+                    return Err(ApplicationError::AuditIncomplete);
+                }
+                let stored = self
+                    .adapters
+                    .audit_events()
+                    .page(AuditReadRequest {
+                        snapshot: Some(manifest.snapshot()),
+                        after_sequence,
+                        limit,
+                    })
+                    .await
+                    .map_err(audit_read_error)?;
+                (manifest, manifest_signature, after_sequence, stored)
+            }
+        };
+        self.export_page(manifest, signature, after_sequence, limit, stored)
+    }
+
+    fn export_page(
+        &self,
+        manifest: AuditExportManifest,
+        manifest_signature: [u8; 64],
+        after_sequence: u64,
+        limit: u32,
+        stored: crate::AuditStoredPage,
+    ) -> Result<AuditExportPage, ApplicationError> {
+        let snapshot = manifest.snapshot();
+        if stored.snapshot != snapshot
+            || stored.events.len()
+                > usize::try_from(limit).map_err(|_| ApplicationError::Invariant)?
+        {
+            return Err(ApplicationError::IntegrityFailure);
+        }
+        let mut expected_sequence = after_sequence
+            .checked_add(1)
+            .ok_or(ApplicationError::InvalidRequest)?;
+        // The chain starts from the all-zero hash; a continuation's link to the event before
+        // its cursor is checked by the store inside the same snapshot read.
+        let mut previous = (after_sequence == 0).then_some([0; 32]);
+        let mut proof = Vec::with_capacity(stored.events.len());
+        for event in stored.events {
+            if event.sequence != expected_sequence
+                || previous.is_some_and(|hash| event.previous_hash != hash)
+                || event.sequence > snapshot.event_count()
+                || (event.sequence == snapshot.event_count()
+                    && snapshot.head() != Some(event.checkpoint()))
+                || self
+                    .adapters
+                    .integrity()
+                    .verify(&event_signature_input(&event.event_hash), &event.signature)
+                    .is_err()
+            {
+                return Err(ApplicationError::IntegrityFailure);
+            }
+            previous = Some(event.event_hash);
+            expected_sequence = expected_sequence
+                .checked_add(1)
+                .ok_or(ApplicationError::IntegrityFailure)?;
+            proof.push(AuditExportEvent::from_stored(event)?);
+        }
+        let last = proof.last().map_or(after_sequence, |event| event.sequence);
+        let (coverage, next_after_sequence) = page_markers(
+            snapshot.event_count(),
+            last,
+            proof.len(),
+            stored.has_more,
+            limit,
+        )?;
+        Ok(AuditExportPage {
+            manifest,
+            manifest_signature,
+            coverage,
+            events: proof,
+            next_after_sequence,
         })
     }
 
@@ -611,6 +829,28 @@ impl<A: Adapters> Application<A> {
     }
 }
 
+fn page_markers(
+    event_count: u64,
+    last_sequence: u64,
+    returned: usize,
+    has_more: bool,
+    limit: u32,
+) -> Result<(Coverage, Option<u64>), ApplicationError> {
+    let complete = last_sequence == event_count;
+    if has_more {
+        if complete
+            || returned != usize::try_from(limit).map_err(|_| ApplicationError::Invariant)?
+        {
+            return Err(ApplicationError::IntegrityFailure);
+        }
+        Ok((Coverage::Partial, Some(last_sequence)))
+    } else if complete {
+        Ok((Coverage::Complete, None))
+    } else {
+        Err(ApplicationError::IntegrityFailure)
+    }
+}
+
 fn names_exactly(recipients: &[HeaderKey], sender: &WalletId, recipient: &WalletId) -> bool {
     recipients.len() == 2
         && recipients.iter().any(|key| key.wallet == *sender)
@@ -677,6 +917,15 @@ fn store_error(error: StoreError) -> ApplicationError {
         StoreError::PendingLimit => ApplicationError::PendingLimit,
         StoreError::NotFound | StoreError::Invariant => ApplicationError::Invariant,
         StoreError::Transient | StoreError::Permanent => ApplicationError::Unavailable,
+    }
+}
+
+fn audit_read_error(error: AuditReadError) -> ApplicationError {
+    match error {
+        AuditReadError::SnapshotChanged | AuditReadError::Invariant => {
+            ApplicationError::IntegrityFailure
+        }
+        AuditReadError::Transient | AuditReadError::Permanent => ApplicationError::Unavailable,
     }
 }
 

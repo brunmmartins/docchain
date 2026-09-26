@@ -10,12 +10,12 @@ use std::{
 };
 
 use docchain_application::{
-    AcceptanceOutcome, CreditPosting, DocumentStore, EventIntegrity, ExchangeRecord, ExchangeStore,
-    StoreError,
+    AcceptanceOutcome, AuditEventStore, AuditReadError, AuditReadRequest, AuditStoredPage,
+    CreditPosting, DocumentStore, EventIntegrity, ExchangeRecord, ExchangeStore, StoreError,
 };
 use docchain_domain::{
-    AuditEvent, DocumentId, DocumentVersion, EventDraft, EventKind, ExchangeId, IdempotencyKey,
-    ObjectId, RequestNonce, Timestamp, WalletId, event_signature_input,
+    AuditEvent, AuditSnapshot, Checkpoint, DocumentId, DocumentVersion, EventDraft, EventKind,
+    ExchangeId, IdempotencyKey, ObjectId, RequestNonce, Timestamp, WalletId, event_signature_input,
 };
 use sqlx::{
     PgPool, Postgres, Row as _, SqlStr, Transaction,
@@ -535,22 +535,6 @@ impl ExchangeStore for PgExchangeStore {
         .collect()
     }
 
-    async fn events(&self, limit: u32) -> Result<Vec<AuditEvent>, StoreError> {
-        sqlx::query(
-            "SELECT sequence, kind, exchange_id, object_id, commitment, envelope_version, \
-             protected_hash, sender_wallet, recipient_wallet, document_id, document_version, \
-             registry_sequence, committed_at, previous_hash, event_hash, signature \
-             FROM audit_events ORDER BY sequence LIMIT $1",
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sql)?
-        .into_iter()
-        .map(row_to_event)
-        .collect()
-    }
-
     async fn object_referenced(&self, object_id: &ObjectId) -> Result<bool, StoreError> {
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM exchanges WHERE object_id = $1)")
             .bind(object_id.as_str())
@@ -565,6 +549,137 @@ impl ExchangeStore for PgExchangeStore {
             .await
             .map(|_| ())
             .map_err(map_sql)
+    }
+}
+
+impl AuditEventStore for PgExchangeStore {
+    async fn page(&self, request: AuditReadRequest) -> Result<AuditStoredPage, AuditReadError> {
+        if !(1..=500).contains(&request.limit) {
+            return Err(AuditReadError::Invariant);
+        }
+        let mut transaction = self.pool.begin().await.map_err(map_audit_sql)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_audit_sql)?;
+
+        let snapshot = match request.snapshot {
+            Some(snapshot) => {
+                match snapshot.head() {
+                    None => {
+                        let exists: bool =
+                            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM audit_events)")
+                                .fetch_one(&mut *transaction)
+                                .await
+                                .map_err(map_audit_sql)?;
+                        if exists {
+                            return Err(AuditReadError::SnapshotChanged);
+                        }
+                    }
+                    Some(expected) => {
+                        let row = sqlx::query(
+                            "SELECT event_hash, signature FROM audit_events WHERE sequence = $1",
+                        )
+                        .bind(to_i64(expected.sequence).map_err(|_| AuditReadError::Invariant)?)
+                        .fetch_optional(&mut *transaction)
+                        .await
+                        .map_err(map_audit_sql)?
+                        .ok_or(AuditReadError::SnapshotChanged)?;
+                        let hash = exact::<32>(row.try_get("event_hash").map_err(map_audit_sql)?)
+                            .map_err(|_| AuditReadError::Invariant)?;
+                        let signature =
+                            exact::<64>(row.try_get("signature").map_err(map_audit_sql)?)
+                                .map_err(|_| AuditReadError::Invariant)?;
+                        if hash != expected.event_hash || signature != expected.signature {
+                            return Err(AuditReadError::SnapshotChanged);
+                        }
+                    }
+                }
+                snapshot
+            }
+            None => {
+                let tail = sqlx::query(
+                    "SELECT sequence, event_hash, signature FROM audit_events \
+                     ORDER BY sequence DESC LIMIT 1",
+                )
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(map_audit_sql)?;
+                match tail {
+                    None => AuditSnapshot::new(0, None).map_err(|_| AuditReadError::Invariant)?,
+                    Some(row) => {
+                        let sequence = from_i64(row.try_get("sequence").map_err(map_audit_sql)?)
+                            .map_err(|_| AuditReadError::Invariant)?;
+                        let head = Checkpoint {
+                            sequence,
+                            event_hash: exact(row.try_get("event_hash").map_err(map_audit_sql)?)
+                                .map_err(|_| AuditReadError::Invariant)?,
+                            signature: exact(row.try_get("signature").map_err(map_audit_sql)?)
+                                .map_err(|_| AuditReadError::Invariant)?,
+                        };
+                        AuditSnapshot::new(sequence, Some(head))
+                            .map_err(|_| AuditReadError::Invariant)?
+                    }
+                }
+            }
+        };
+
+        if request.after_sequence > snapshot.event_count() {
+            return Err(AuditReadError::SnapshotChanged);
+        }
+        let previous_hash = if request.after_sequence == 0 {
+            [0; 32]
+        } else {
+            sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT event_hash FROM audit_events WHERE sequence = $1",
+            )
+            .bind(to_i64(request.after_sequence).map_err(|_| AuditReadError::Invariant)?)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(map_audit_sql)?
+            .ok_or(AuditReadError::SnapshotChanged)
+            .and_then(|bytes| exact(bytes).map_err(|_| AuditReadError::Invariant))?
+        };
+        let fetch_limit = i64::from(request.limit)
+            .checked_add(1)
+            .ok_or(AuditReadError::Invariant)?;
+        let rows = sqlx::query(
+            "SELECT sequence, kind, exchange_id, object_id, commitment, envelope_version, \
+             protected_hash, sender_wallet, recipient_wallet, document_id, document_version, \
+             registry_sequence, committed_at, previous_hash, event_hash, signature \
+             FROM audit_events WHERE sequence > $1 AND sequence <= $2 \
+             ORDER BY sequence LIMIT $3",
+        )
+        .bind(to_i64(request.after_sequence).map_err(|_| AuditReadError::Invariant)?)
+        .bind(to_i64(snapshot.event_count()).map_err(|_| AuditReadError::Invariant)?)
+        .bind(fetch_limit)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(map_audit_sql)?;
+        let mut events = rows
+            .into_iter()
+            .map(|row| row_to_event(row).map_err(|_| AuditReadError::Invariant))
+            .collect::<Result<Vec<_>, _>>()?;
+        let limit = usize::try_from(request.limit).map_err(|_| AuditReadError::Invariant)?;
+        let has_more = events.len() > limit;
+        if has_more {
+            events.truncate(limit);
+        }
+        if let Some(first) = events.first() {
+            if first.sequence != request.after_sequence.saturating_add(1)
+                || first.previous_hash != previous_hash
+            {
+                return Err(AuditReadError::SnapshotChanged);
+            }
+        } else if request.after_sequence != snapshot.event_count() {
+            return Err(AuditReadError::SnapshotChanged);
+        }
+        transaction.commit().await.map_err(map_audit_sql)?;
+        Ok(AuditStoredPage {
+            snapshot,
+            events,
+            has_more,
+        })
     }
 }
 
@@ -735,6 +850,14 @@ fn map_sql(error: sqlx::Error) -> StoreError {
             StoreError::Transient
         }
         _ => StoreError::Permanent,
+    }
+}
+
+fn map_audit_sql(error: sqlx::Error) -> AuditReadError {
+    match map_sql(error) {
+        StoreError::Transient => AuditReadError::Transient,
+        StoreError::Permanent => AuditReadError::Permanent,
+        _ => AuditReadError::Invariant,
     }
 }
 
@@ -1241,7 +1364,15 @@ mod tests {
                 .expect("find by idempotency key")
                 .expect("stored exchange");
             assert_eq!(by_key.committed_at, committed_at);
-            let events = store.events(10).await.expect("events");
+            let events = store
+                .page(AuditReadRequest {
+                    snapshot: None,
+                    after_sequence: 0,
+                    limit: 10,
+                })
+                .await
+                .expect("events")
+                .events;
             assert_eq!(
                 events
                     .iter()
@@ -1251,6 +1382,171 @@ mod tests {
                     (EventKind::Delivered, committed_at),
                     (EventKind::Accepted, committed_at)
                 ]
+            );
+        }
+
+        /// Runs one statement as the table owner with the append-only triggers disabled.
+        async fn tamper(pool: &PgPool, statement: &str) {
+            let mut transaction = pool.begin().await.expect("transaction");
+            for action in ["DISABLE", "ENABLE ALWAYS"] {
+                for trigger in [
+                    "audit_events_refuse_update_delete",
+                    "audit_events_refuse_truncate",
+                ] {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                        "ALTER TABLE audit_events {action} TRIGGER {trigger}"
+                    )))
+                    .execute(&mut *transaction)
+                    .await
+                    .expect("trigger");
+                }
+                if action == "DISABLE" {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(statement.to_owned()))
+                        .execute(&mut *transaction)
+                        .await
+                        .expect("tamper");
+                }
+            }
+            transaction.commit().await.expect("commit");
+        }
+
+        #[tokio::test]
+        async fn audit_pages_are_contiguous_and_hold_the_manifest_snapshot_across_append() {
+            use crate::providers::AuditKey;
+
+            let (fixture, pool) = migrated().await;
+            let integrity = AuditKey::load(&fixture.root.join("audit.key")).expect("audit key");
+            let store = PgExchangeStore::new(pool.clone());
+            let send = |index: u8| {
+                let record = ExchangeRecord {
+                    exchange_id: ExchangeId::new(format!(
+                        "exc_000000000000000000000000000000{index:02}"
+                    ))
+                    .expect("exchange"),
+                    sender: WalletId::new("wal_0000000000000001").expect("wallet"),
+                    recipient: WalletId::new("wal_0000000000000002").expect("wallet"),
+                    document_id: DocumentId::new("doc_0000000000000001").expect("document"),
+                    document_version: DocumentVersion::new(u64::from(index)).expect("version"),
+                    request_nonce: RequestNonce::new([index; 16]),
+                    idempotency_key: IdempotencyKey::new(format!("idem_00000000000000{index:02}"))
+                        .expect("key"),
+                    schema_id: "urn:docchain:schema:service-application:1.0.0".to_owned(),
+                    schema_version: "1.0.0".to_owned(),
+                    object_id: ObjectId::new(format!(
+                        "obj_000000000000000000000000000000{index:02}"
+                    ))
+                    .expect("object"),
+                    envelope_commitment: [index; 32],
+                    protected_hash: [2; 32],
+                    envelope_version: 1,
+                    registry_sequence: 3,
+                    committed_at: Timestamp::from_unix_seconds(86_400),
+                    accepted: false,
+                };
+                let draft = EventDraft {
+                    kind: EventKind::Delivered,
+                    exchange_id: record.exchange_id.clone(),
+                    object_id: record.object_id.clone(),
+                    envelope_commitment: record.envelope_commitment,
+                    envelope_version: record.envelope_version,
+                    protected_hash: record.protected_hash,
+                    sender: record.sender.clone(),
+                    recipient: record.recipient.clone(),
+                    document_id: record.document_id.clone(),
+                    document_version: record.document_version,
+                    registry_sequence: record.registry_sequence,
+                    committed_at: record.committed_at,
+                };
+                (record, draft)
+            };
+            let read = |snapshot, after_sequence, limit| {
+                store.page(AuditReadRequest {
+                    snapshot,
+                    after_sequence,
+                    limit,
+                })
+            };
+
+            let empty = read(None, 0, 1).await.expect("empty chain");
+            assert_eq!(empty.snapshot, AuditSnapshot::new(0, None).expect("empty"));
+            assert!(empty.events.is_empty() && !empty.has_more);
+
+            for index in 1..=3 {
+                let (record, draft) = send(index);
+                store
+                    .commit_send(&record, draft, &integrity, 100)
+                    .await
+                    .expect("send");
+            }
+            // The initial page selects the current tail and reads limit + 1 rows to know more.
+            let first = read(None, 0, 1).await.expect("first page");
+            let snapshot = first.snapshot;
+            assert_eq!(snapshot.event_count(), 3);
+            assert!(first.has_more);
+            assert_eq!(first.events.len(), 1);
+            assert_eq!(first.events[0].previous_hash, [0; 32]);
+            let whole = read(None, 0, 3).await.expect("whole chain");
+            assert!(!whole.has_more);
+            assert_eq!(snapshot.head(), Some(whole.events[2].checkpoint()));
+
+            // An append after selection is excluded from the manifest snapshot.
+            let (record, draft) = send(4);
+            store
+                .commit_send(&record, draft, &integrity, 100)
+                .await
+                .expect("append after snapshot");
+            let second = read(Some(snapshot), 1, 1).await.expect("second page");
+            assert_eq!(second.snapshot, snapshot);
+            assert_eq!(second.events[0].sequence, 2);
+            assert_eq!(second.events[0].previous_hash, first.events[0].event_hash);
+            assert!(second.has_more);
+            let last = read(Some(snapshot), 2, 500).await.expect("last page");
+            assert_eq!(
+                last.events
+                    .iter()
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                [3]
+            );
+            assert!(!last.has_more);
+
+            // A fresh selection is the current tail, never an older signed head.
+            let fresh = read(None, 0, 1).await.expect("fresh selection");
+            assert_eq!(fresh.snapshot.event_count(), 4);
+
+            // A head that is not stored, or stored differently, is a changed snapshot.
+            let mut altered = snapshot.head().expect("head");
+            altered.event_hash[0] ^= 1;
+            let mut missing = altered;
+            missing.sequence = 9;
+            for changed in [
+                AuditSnapshot::new(3, Some(altered)).expect("altered"),
+                AuditSnapshot::new(9, Some(missing)).expect("missing"),
+                AuditSnapshot::new(0, None).expect("empty"),
+            ] {
+                assert_eq!(
+                    read(Some(changed), 0, 1).await,
+                    Err(AuditReadError::SnapshotChanged)
+                );
+            }
+            assert_eq!(
+                read(Some(snapshot), 4, 1).await,
+                Err(AuditReadError::SnapshotChanged)
+            );
+            assert_eq!(read(None, 0, 0).await, Err(AuditReadError::Invariant));
+            assert_eq!(read(None, 0, 501).await, Err(AuditReadError::Invariant));
+
+            // A stored gap breaks the link to the cursor inside the snapshot read.
+            tamper(&pool, "DELETE FROM audit_events WHERE sequence = 2").await;
+            assert_eq!(
+                read(Some(snapshot), 1, 1).await,
+                Err(AuditReadError::SnapshotChanged)
+            );
+            assert_eq!(
+                read(Some(snapshot), 0, 3)
+                    .await
+                    .map(|page| page.events.len()),
+                Ok(2)
             );
         }
 

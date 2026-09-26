@@ -5,20 +5,25 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     body::Bytes,
+    extract::rejection::BytesRejection,
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{
-        HeaderMap, StatusCode, Uri,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, StatusCode, Uri,
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use docchain_application::{Actor, ApplicationError, Credential, SendCopyCommand};
+use docchain_application::{
+    Actor, ApplicationError, AuditExportPage, AuditExportRequest, Coverage, Credential,
+    SendCopyCommand,
+};
 use docchain_domain::{
-    Checkpoint, DocumentId, DocumentVersion, ExchangeId, IdempotencyKey, MAX_DOCUMENT_BYTES,
-    RequestNonce, WalletId, canonicalize, parse_document,
+    AuditChallenge, AuditExportManifest, AuditSnapshot, Checkpoint, DocumentId, DocumentVersion,
+    ExchangeId, IdempotencyKey, MAX_DOCUMENT_BYTES, RequestNonce, WalletId, canonicalize,
+    parse_bounded_json, parse_document,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,13 +76,44 @@ pub fn router(service: Arc<DocchainService>, config: HttpConfig) -> Router {
         .route("/v1/exchanges/{exchange_id}/document", get(read_document))
         .route("/v1/inboxes/{wallet_id}", get(list_inbox))
         .route("/v1/audit/verify", get(verify_audit))
+        .route(
+            AUDIT_KEY_ROUTE,
+            get(audit_key).layer(DefaultBodyLimit::max(0)),
+        )
+        .route(
+            AUDIT_EXPORT_ROUTE,
+            post(export_audit_events).layer(DefaultBodyLimit::max(MAX_AUDIT_EXPORT_BODY)),
+        )
         .layer(DefaultBodyLimit::max(MAX_DOCUMENT_BYTES))
         .layer(middleware::from_fn_with_state(gate, admission));
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .merge(business)
+        .layer(middleware::from_fn(no_store))
         .with_state(state)
+}
+
+const AUDIT_KEY_ROUTE: &str = "/v1/audit/key";
+pub(crate) const AUDIT_EXPORT_ROUTE: &str = "/v1/audit/events/export";
+/// Largest accepted export request body, in bytes.
+const MAX_AUDIT_EXPORT_BODY: usize = 4 * 1024;
+/// Deepest accepted export request nesting.
+const MAX_AUDIT_EXPORT_DEPTH: usize = 4;
+
+/// Marks every response on the audit proof routes, including overload, timeout, and method
+/// errors produced outside their handlers, as uncacheable. The routes have no path parameters,
+/// so the path equals the route template. Serving applies it again outside its shutdown
+/// cancellation, so a proof request cancelled at the drain deadline is marked too.
+pub(crate) async fn no_store(request: Request, next: Next) -> Response {
+    let proof_route = matches!(request.uri().path(), AUDIT_KEY_ROUTE | AUDIT_EXPORT_ROUTE);
+    let mut response = next.run(request).await;
+    if proof_route {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 async fn admission(State(gate): State<Gate>, request: Request, next: Next) -> Response {
@@ -242,11 +278,201 @@ struct AuditDto {
 
 /// A signed chain head. An auditor keeps the one it last verified and presents it again, so
 /// removing events after it is detected.
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CheckpointDto {
     sequence: u64,
     event_hash: String,
     signature: String,
+}
+
+#[derive(Serialize)]
+struct AuditKeyDto {
+    public_key: String,
+    fingerprint: String,
+}
+
+/// `GET /v1/audit/key`: the pinned audit public key and its fingerprint, for auditors only.
+///
+/// The request has no query and no body. The fingerprint in the response is never a trust
+/// anchor: a verifier compares it with the value provisioned to it separately.
+async fn audit_key(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<AuditKeyDto>, ApiError> {
+    let actor = authenticate(&state, &headers).await?;
+    if uri.query().is_some() || !body.is_ok_and(|body| body.is_empty()) {
+        return Err(ApiError::InvalidRequest);
+    }
+    let proof = state.service.audit_public_key(&actor)?;
+    Ok(Json(AuditKeyDto {
+        public_key: URL_SAFE_NO_PAD.encode(proof.public_key()),
+        fingerprint: URL_SAFE_NO_PAD.encode(proof.fingerprint().as_bytes()),
+    }))
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExportManifestDto {
+    export_version: u8,
+    challenge: String,
+    audit_key_fingerprint: String,
+    event_count: u64,
+    head: Option<CheckpointDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportStartDto {
+    challenge: String,
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportContinueDto {
+    manifest: ExportManifestDto,
+    manifest_signature: String,
+    after_sequence: u64,
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ExportRequestDto {
+    Start(ExportStartDto),
+    Continue(ExportContinueDto),
+}
+
+#[derive(Serialize)]
+struct ExportEventDto {
+    preimage_version: u8,
+    preimage: String,
+    sequence: u64,
+    previous_event_hash: String,
+    event_hash: String,
+    signature: String,
+}
+
+#[derive(Serialize)]
+struct ExportPageDto {
+    manifest: ExportManifestDto,
+    manifest_signature: String,
+    coverage: &'static str,
+    events: Vec<ExportEventDto>,
+    next_after_sequence: Option<u64>,
+}
+
+/// `POST /v1/audit/events/export`: one page of challenge-bound signed-event proof.
+///
+/// All proof travels in the closed JSON body, never the request target. A start body holds the
+/// verifier's fresh `challenge`; a continuation repeats the signed `manifest` and its signature
+/// with `after_sequence`. Both may add `limit`, from 1 through 500. Only the page ending at the
+/// manifest's event count says `complete`. The first complete export is a baseline; a later
+/// export detects rollback only at or before the newest checkpoint the auditor retained, and
+/// neither proves absolute freshness.
+async fn export_audit_events(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<ExportPageDto>, ApiError> {
+    let actor = authenticate(&state, &headers).await?;
+    if uri.query().is_some() {
+        return Err(ApiError::InvalidRequest);
+    }
+    let body = body.map_err(|_| ApiError::InvalidRequest)?;
+    let strict = parse_bounded_json(&body, MAX_AUDIT_EXPORT_BODY, MAX_AUDIT_EXPORT_DEPTH)
+        .map_err(|_| ApiError::InvalidRequest)?;
+    // `limit` is optional, but when present it is an integer, never `null`.
+    if strict.value().get("limit").is_some_and(Value::is_null) {
+        return Err(ApiError::InvalidRequest);
+    }
+    let dto: ExportRequestDto =
+        serde_json::from_value(strict.value().clone()).map_err(|_| ApiError::InvalidRequest)?;
+    let request = match dto {
+        ExportRequestDto::Start(start) => AuditExportRequest::start(
+            AuditChallenge::new(strict_fixed(&start.challenge)?),
+            start.limit,
+        ),
+        ExportRequestDto::Continue(continuation) => AuditExportRequest::continuation(
+            manifest_from_dto(continuation.manifest)?,
+            strict_fixed(&continuation.manifest_signature)?,
+            continuation.after_sequence,
+            continuation.limit,
+        ),
+    }
+    .map_err(|_| ApiError::InvalidRequest)?;
+    state
+        .service
+        .export_audit_events(&actor, request)
+        .await
+        .map(export_page_dto)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+fn manifest_from_dto(dto: ExportManifestDto) -> Result<AuditExportManifest, ApiError> {
+    if dto.export_version != 1 {
+        return Err(ApiError::InvalidRequest);
+    }
+    let head = dto
+        .head
+        .map(|head| -> Result<Checkpoint, ApiError> {
+            Ok(Checkpoint {
+                sequence: head.sequence,
+                event_hash: strict_fixed(&head.event_hash)?,
+                signature: strict_fixed(&head.signature)?,
+            })
+        })
+        .transpose()?;
+    let snapshot =
+        AuditSnapshot::new(dto.event_count, head).map_err(|_| ApiError::InvalidRequest)?;
+    Ok(AuditExportManifest::new(
+        AuditChallenge::new(strict_fixed(&dto.challenge)?),
+        strict_fixed(&dto.audit_key_fingerprint)?,
+        snapshot,
+    ))
+}
+
+fn manifest_dto(manifest: AuditExportManifest) -> ExportManifestDto {
+    ExportManifestDto {
+        export_version: 1,
+        challenge: URL_SAFE_NO_PAD.encode(manifest.challenge().as_bytes()),
+        audit_key_fingerprint: URL_SAFE_NO_PAD.encode(manifest.audit_key_fingerprint()),
+        event_count: manifest.snapshot().event_count(),
+        head: manifest.snapshot().head().map(|head| CheckpointDto {
+            sequence: head.sequence,
+            event_hash: URL_SAFE_NO_PAD.encode(head.event_hash),
+            signature: URL_SAFE_NO_PAD.encode(head.signature),
+        }),
+    }
+}
+
+fn export_page_dto(page: AuditExportPage) -> ExportPageDto {
+    ExportPageDto {
+        manifest: manifest_dto(page.manifest),
+        manifest_signature: URL_SAFE_NO_PAD.encode(page.manifest_signature),
+        coverage: match page.coverage {
+            Coverage::Partial => "partial",
+            Coverage::Complete => "complete",
+        },
+        events: page
+            .events
+            .into_iter()
+            .map(|event| ExportEventDto {
+                preimage_version: event.preimage_version,
+                preimage: URL_SAFE_NO_PAD.encode(event.preimage),
+                sequence: event.sequence,
+                previous_event_hash: URL_SAFE_NO_PAD.encode(event.previous_event_hash),
+                event_hash: URL_SAFE_NO_PAD.encode(event.event_hash),
+                signature: URL_SAFE_NO_PAD.encode(event.signature),
+            })
+            .collect(),
+        next_after_sequence: page.next_after_sequence,
+    }
 }
 
 async fn verify_audit(
@@ -329,6 +555,13 @@ fn strict_b64(value: &str) -> Result<Vec<u8>, ApiError> {
     Ok(decoded)
 }
 
+fn strict_fixed<const N: usize>(value: &str) -> Result<[u8; N], ApiError> {
+    strict_b64(value)?
+        .try_into()
+        .map_err(|_| ApiError::InvalidRequest)
+}
+
+#[derive(Debug)]
 enum ApiError {
     Unauthenticated,
     InvalidRequest,
@@ -403,6 +636,7 @@ mod tests {
 
     struct Reply {
         status: u16,
+        headers: Vec<u8>,
         body: Vec<u8>,
     }
 
@@ -415,6 +649,12 @@ mod tests {
             self.body
                 .windows(PLAINTEXT.len())
                 .any(|window| window == PLAINTEXT)
+        }
+
+        fn no_store(&self) -> bool {
+            String::from_utf8_lossy(&self.headers)
+                .to_ascii_lowercase()
+                .contains("cache-control: no-store")
         }
     }
 
@@ -445,6 +685,7 @@ mod tests {
             .expect("status code");
         Reply {
             status,
+            headers: response[..split].to_vec(),
             body: response[split + 4..].to_vec(),
         }
     }
@@ -487,6 +728,414 @@ mod tests {
             "document": document,
         })
         .to_string()
+    }
+
+    fn keys(value: &Value) -> Vec<&str> {
+        value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn category(reply: &Reply) -> String {
+        reply.json()["category"]
+            .as_str()
+            .expect("problem category")
+            .to_owned()
+    }
+
+    /// Posts `body` to the export route as the auditor.
+    async fn export(harness: &DemoHarness, body: &str) -> Reply {
+        send(
+            router(harness.service(), HttpConfig::default()),
+            &post(
+                "/v1/audit/events/export",
+                &bearer(&harness.auditor_credential),
+                body,
+            ),
+        )
+        .await
+    }
+
+    /// Delivers and accepts one copy through HTTP, leaving two events.
+    async fn two_events(harness: &DemoHarness) {
+        let app = || router(harness.service(), HttpConfig::default());
+        let delivered = send(
+            app(),
+            &post(
+                "/v1/send-copies",
+                &bearer(&harness.sender_credential),
+                &send_copy_body(),
+            ),
+        )
+        .await;
+        assert_eq!(delivered.status, 201);
+        let exchange = delivered.json()["exchange_id"]
+            .as_str()
+            .expect("exchange")
+            .to_owned();
+        let accepted = send(
+            app(),
+            &post(
+                &format!("/v1/exchanges/{exchange}/acceptances"),
+                &bearer(&harness.recipient_credential),
+                r#"{"idempotency_key":"idem_accept0000000001"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(accepted.status, 200);
+    }
+
+    #[tokio::test]
+    async fn audit_key_contract_is_closed_authorized_and_no_store() {
+        let harness = DemoHarness::new().await.expect("harness");
+        let app = || router(harness.service(), HttpConfig::default());
+        let published = send(
+            app(),
+            &get("/v1/audit/key", &bearer(&harness.auditor_credential)),
+        )
+        .await;
+        assert_eq!(published.status, 200);
+        assert!(published.no_store());
+        let value = published.json();
+        assert_eq!(keys(&value), ["fingerprint", "public_key"]);
+        let public_key = strict_fixed::<32>(value["public_key"].as_str().expect("public key"))
+            .expect("canonical public key");
+        let fingerprint = strict_fixed::<32>(value["fingerprint"].as_str().expect("fingerprint"))
+            .expect("canonical fingerprint");
+        assert_eq!(fingerprint, harness.expected_audit_fingerprint());
+        assert_eq!(docchain_domain::sha256(&public_key), fingerprint);
+
+        let cases = [
+            (get("/v1/audit/key", ""), 401, "unauthenticated"),
+            (get("/v1/audit/key", &bearer("unknown")), 401, "unauthenticated"),
+            (
+                get("/v1/audit/key", &bearer(&harness.sender_credential)),
+                403,
+                "forbidden",
+            ),
+            (
+                get("/v1/audit/key", &bearer(&harness.operator_credential)),
+                403,
+                "forbidden",
+            ),
+            (
+                get(
+                    "/v1/audit/key?fingerprint=proof",
+                    &bearer(&harness.auditor_credential),
+                ),
+                422,
+                "invalid-request",
+            ),
+            (
+                format!(
+                    "GET /v1/audit/key HTTP/1.1\r\nHost: localhost\r\n{}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                    bearer(&harness.auditor_credential)
+                )
+                .into_bytes(),
+                422,
+                "invalid-request",
+            ),
+        ];
+        for (request, status, expected) in cases {
+            let denied = send(app(), &request).await;
+            assert_eq!(denied.status, status);
+            assert_eq!(category(&denied), expected);
+            assert!(denied.no_store());
+            assert!(
+                !String::from_utf8_lossy(&denied.body).contains(&value["public_key"].to_string())
+            );
+        }
+        let wrong_method = send(
+            app(),
+            &post("/v1/audit/key", &bearer(&harness.auditor_credential), "{}"),
+        )
+        .await;
+        assert_eq!(wrong_method.status, 405);
+        assert!(wrong_method.no_store());
+    }
+
+    #[tokio::test]
+    async fn audit_export_translates_only_approved_proof_fields() {
+        let harness = DemoHarness::new().await.expect("harness");
+        let app = || router(harness.service(), HttpConfig::default());
+        two_events(&harness).await;
+        let challenge = URL_SAFE_NO_PAD.encode([7; 32]);
+        let start = serde_json::json!({"challenge": challenge}).to_string();
+        let exported = export(&harness, &start).await;
+        assert_eq!(exported.status, 200);
+        assert!(exported.no_store());
+        let value = exported.json();
+        assert_eq!(
+            keys(&value),
+            [
+                "coverage",
+                "events",
+                "manifest",
+                "manifest_signature",
+                "next_after_sequence"
+            ]
+        );
+        assert_eq!(
+            keys(&value["manifest"]),
+            [
+                "audit_key_fingerprint",
+                "challenge",
+                "event_count",
+                "export_version",
+                "head"
+            ]
+        );
+        assert_eq!(value["manifest"]["export_version"], 1);
+        assert_eq!(value["manifest"]["challenge"], challenge.as_str());
+        assert_eq!(
+            keys(&value["manifest"]["head"]),
+            ["event_hash", "sequence", "signature"]
+        );
+        let events = value["events"].as_array().expect("events");
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(
+                keys(event),
+                [
+                    "event_hash",
+                    "preimage",
+                    "preimage_version",
+                    "previous_event_hash",
+                    "sequence",
+                    "signature"
+                ]
+            );
+            assert_eq!(event["preimage_version"], 1);
+            let preimage = strict_b64(event["preimage"].as_str().expect("preimage"))
+                .expect("canonical preimage");
+            assert_eq!(
+                URL_SAFE_NO_PAD.encode(docchain_domain::sha256(&preimage)),
+                event["event_hash"].as_str().expect("hash")
+            );
+        }
+        assert_eq!(value["coverage"], "complete");
+        assert_eq!(value["next_after_sequence"], Value::Null);
+        assert!(!exported.reveals_plaintext());
+        let text = String::from_utf8(exported.body.clone()).expect("JSON");
+        for prohibited in [
+            harness.auditor_credential.as_str(),
+            harness.sender_credential.as_str(),
+            "plaintext",
+            "private",
+            "envelope",
+        ] {
+            assert!(!text.contains(prohibited), "{prohibited}");
+        }
+
+        let mut rejected = vec![
+            (
+                send(app(), &post("/v1/audit/events/export", "", &start)).await,
+                401,
+            ),
+            (
+                send(
+                    app(),
+                    &post(
+                        "/v1/audit/events/export",
+                        &bearer(&harness.recipient_credential),
+                        &start,
+                    ),
+                )
+                .await,
+                403,
+            ),
+            (
+                send(
+                    app(),
+                    &post(
+                        "/v1/audit/events/export",
+                        &bearer(&harness.operator_credential),
+                        &start,
+                    ),
+                )
+                .await,
+                403,
+            ),
+            (
+                send(
+                    app(),
+                    &post(
+                        &format!("/v1/audit/events/export?challenge={challenge}"),
+                        &bearer(&harness.auditor_credential),
+                        &start,
+                    ),
+                )
+                .await,
+                422,
+            ),
+        ];
+        let long = URL_SAFE_NO_PAD.encode([7; 33]);
+        let padded = format!("{challenge}=");
+        let over_body = format!(
+            r#"{{"challenge":"{challenge}","limit":1{}}}"#,
+            " ".repeat(MAX_AUDIT_EXPORT_BODY)
+        );
+        for body in [
+            format!(r#"{{"challenge":"{challenge}","unknown":true}}"#),
+            format!(r#"{{"challenge":"{challenge}","challenge":"{challenge}"}}"#),
+            format!(r#"{{"challenge":"{challenge}","after_sequence":1}}"#),
+            format!(r#"{{"challenge":"{challenge}","limit":null}}"#),
+            format!(r#"{{"challenge":"{challenge}","limit":0}}"#),
+            format!(r#"{{"challenge":"{challenge}","limit":501}}"#),
+            format!(r#"{{"challenge":"{long}"}}"#),
+            format!(r#"{{"challenge":"{padded}"}}"#),
+            r#"{"challenge":"AAAA+/AA"}"#.to_owned(),
+            r#"{"challenge":[[[["deep"]]]]}"#.to_owned(),
+            "{}".to_owned(),
+            over_body,
+        ] {
+            rejected.push((export(&harness, &body).await, 422));
+        }
+        for (reply, status) in &rejected {
+            assert_eq!(reply.status, *status);
+            assert!(reply.no_store());
+            assert_eq!(keys(&reply.json()), ["category"]);
+        }
+        let wrong_method = send(
+            app(),
+            &get(
+                "/v1/audit/events/export",
+                &bearer(&harness.auditor_credential),
+            ),
+        )
+        .await;
+        assert_eq!(wrong_method.status, 405);
+        assert!(wrong_method.no_store());
+        let overloaded = send(
+            router(
+                harness.service(),
+                HttpConfig {
+                    max_in_flight: 0,
+                    ..HttpConfig::default()
+                },
+            ),
+            &post(
+                "/v1/audit/events/export",
+                &bearer(&harness.auditor_credential),
+                &start,
+            ),
+        )
+        .await;
+        assert_eq!(overloaded.status, 503);
+        assert!(overloaded.no_store());
+        let other_route = send(
+            app(),
+            &get("/v1/audit/verify", &bearer(&harness.auditor_credential)),
+        )
+        .await;
+        assert!(!other_route.no_store());
+    }
+
+    #[tokio::test]
+    async fn audit_export_reports_partial_until_manifest_complete() {
+        let harness = DemoHarness::new().await.expect("harness");
+        let empty = export(
+            &harness,
+            &serde_json::json!({"challenge": URL_SAFE_NO_PAD.encode([5; 32])}).to_string(),
+        )
+        .await
+        .json();
+        assert_eq!(
+            (
+                &empty["coverage"],
+                &empty["manifest"]["event_count"],
+                &empty["manifest"]["head"],
+                &empty["next_after_sequence"]
+            ),
+            (
+                &Value::from("complete"),
+                &Value::from(0),
+                &Value::Null,
+                &Value::Null
+            )
+        );
+        assert_eq!(empty["events"], serde_json::json!([]));
+
+        two_events(&harness).await;
+        let first = export(
+            &harness,
+            &serde_json::json!({"challenge": URL_SAFE_NO_PAD.encode([8; 32]), "limit": 1})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(first.status, 200);
+        let first = first.json();
+        assert_eq!(first["coverage"], "partial");
+        assert_eq!(first["next_after_sequence"], 1);
+        assert_eq!(first["manifest"]["event_count"], 2);
+        assert_eq!(first["manifest"]["head"]["sequence"], 2);
+        let continuation = |manifest: &Value, signature: &Value, after: u64| {
+            serde_json::json!({
+                "manifest": manifest,
+                "manifest_signature": signature,
+                "after_sequence": after,
+                "limit": 1
+            })
+            .to_string()
+        };
+        let second = export(
+            &harness,
+            &continuation(&first["manifest"], &first["manifest_signature"], 1),
+        )
+        .await;
+        assert_eq!(second.status, 200);
+        assert!(second.no_store());
+        let second = second.json();
+        assert_eq!(second["coverage"], "complete");
+        assert_eq!(second["next_after_sequence"], Value::Null);
+        assert_eq!(second["events"][0]["sequence"], 2);
+        assert_eq!(second["manifest"], first["manifest"]);
+        assert_eq!(second["manifest_signature"], first["manifest_signature"]);
+
+        // A changed, re-challenged, or unsigned manifest and an out-of-snapshot cursor fail.
+        let mut changed = first["manifest"].clone();
+        changed["event_count"] = Value::from(1);
+        changed["head"]["sequence"] = Value::from(1);
+        let mut rechallenged = first["manifest"].clone();
+        rechallenged["challenge"] = Value::from(URL_SAFE_NO_PAD.encode([9; 32]));
+        let mut extra = first["manifest"].clone();
+        extra["head"]["extra"] = Value::from(1);
+        let mut version = first["manifest"].clone();
+        version["export_version"] = Value::from(2);
+        let mut bad_signature =
+            strict_fixed::<64>(first["manifest_signature"].as_str().expect("signature"))
+                .expect("signature bytes");
+        bad_signature[0] ^= 1;
+        let bad_signature = Value::from(URL_SAFE_NO_PAD.encode(bad_signature));
+        let signature = &first["manifest_signature"];
+        for body in [
+            continuation(&changed, signature, 1),
+            continuation(&rechallenged, signature, 1),
+            continuation(&extra, signature, 1),
+            continuation(&version, signature, 1),
+            continuation(&first["manifest"], &bad_signature, 1),
+            continuation(&first["manifest"], signature, 0),
+            continuation(&first["manifest"], signature, 2),
+        ] {
+            let reply = export(&harness, &body).await;
+            assert_eq!(
+                (reply.status, category(&reply)),
+                (422, "invalid-request".to_owned())
+            );
+            assert!(reply.no_store());
+        }
+
+        // Removing the signed head makes the continuation an integrity failure, not a prefix.
+        harness.truncate_last_event().await.expect("truncate");
+        let reply = export(&harness, &continuation(&first["manifest"], signature, 1)).await;
+        assert_eq!(
+            (reply.status, category(&reply)),
+            (409, "integrity-failure".to_owned())
+        );
+        assert!(reply.no_store());
     }
 
     #[tokio::test]

@@ -15,14 +15,16 @@ use std::{
 };
 
 use docchain_domain::{
-    AuditEvent, DocumentId, DocumentVersion, EventDraft, ExchangeId, RequestNonce, Timestamp,
-    event_signature_input, parse_document,
+    AuditChallenge, AuditEvent, AuditExportManifest, AuditSnapshot, DocumentId, DocumentVersion,
+    EventDraft, ExchangeId, RequestNonce, Timestamp, event_signature_input, parse_document,
 };
 
 use super::*;
+use crate::AuditKeyPin;
 use crate::ports::{
-    Clock, DocumentStore, EnvelopeCryptography, EnvelopeHeader, EventIntegrity, ExchangeStore,
-    Identity, IntegrityError, KeyRegistry, SchemaArtifact, SchemaRegistry, SealedEnvelope,
+    AuditEventStore, AuditReadError, AuditReadRequest, AuditStoredPage, Clock, DocumentStore,
+    EnvelopeCryptography, EnvelopeHeader, EventIntegrity, ExchangeStore, Identity, IntegrityError,
+    KeyRegistry, SchemaArtifact, SchemaRegistry, SealedEnvelope,
 };
 
 const SCHEMA_ID: &str = "urn:docchain:schema:service-application:1.0.0";
@@ -79,6 +81,8 @@ struct Fake {
     acceptance_keys: Mutex<Vec<(WalletId, IdempotencyKey)>>,
     events: Mutex<Vec<AuditEvent>>,
     postings: Mutex<Vec<CreditPosting>>,
+    /// How many signatures the audit key has produced.
+    signatures: AtomicUsize,
     /// How many upcoming replay lookups see the store as it was before a concurrent commit.
     stale_reads: AtomicUsize,
 }
@@ -134,6 +138,7 @@ impl Fake {
             acceptance_keys: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
             postings: Mutex::new(Vec::new()),
+            signatures: AtomicUsize::new(0),
             stale_reads: AtomicUsize::new(0),
         }
     }
@@ -342,17 +347,27 @@ impl EnvelopeCryptography for Fake {
     }
 }
 
+/// The fake audit key's deterministic signature over `input`.
+fn fake_signature(input: &[u8]) -> [u8; 64] {
+    let first = sha256(&[b"fake-audit-key".as_slice(), input].concat());
+    let mut signature = [0; 64];
+    signature[..32].copy_from_slice(&first);
+    signature[32..].copy_from_slice(&sha256(&first));
+    signature
+}
+
 impl EventIntegrity for Fake {
+    fn public_key(&self) -> Result<[u8; 32], IntegrityError> {
+        Ok([42; 32])
+    }
+
     fn sign(&self, input: &[u8]) -> Result<[u8; 64], IntegrityError> {
-        let first = sha256(&[b"fake-audit-key".as_slice(), input].concat());
-        let mut signature = [0; 64];
-        signature[..32].copy_from_slice(&first);
-        signature[32..].copy_from_slice(&sha256(&first));
-        Ok(signature)
+        self.signatures.fetch_add(1, Ordering::SeqCst);
+        Ok(fake_signature(input))
     }
 
     fn verify(&self, input: &[u8], signature: &[u8; 64]) -> Result<(), IntegrityError> {
-        (self.sign(input)? == *signature)
+        (fake_signature(input) == *signature)
             .then_some(())
             .ok_or(IntegrityError::AuthenticationFailed)
     }
@@ -533,17 +548,6 @@ impl ExchangeStore for Fake {
             .collect())
     }
 
-    async fn events(&self, limit: u32) -> Result<Vec<AuditEvent>, StoreError> {
-        Ok(self
-            .events
-            .lock()
-            .expect("events")
-            .iter()
-            .take(usize::try_from(limit).map_err(|_| StoreError::Invariant)?)
-            .cloned()
-            .collect())
-    }
-
     async fn object_referenced(&self, object_id: &ObjectId) -> Result<bool, StoreError> {
         Ok(self
             .exchanges
@@ -555,6 +559,50 @@ impl ExchangeStore for Fake {
 
     async fn ping(&self) -> Result<(), StoreError> {
         Ok(())
+    }
+}
+
+impl AuditEventStore for Fake {
+    async fn page(&self, request: AuditReadRequest) -> Result<AuditStoredPage, AuditReadError> {
+        let events = self.events.lock().expect("events");
+        let selected = AuditSnapshot::new(
+            u64::try_from(events.len()).map_err(|_| AuditReadError::Invariant)?,
+            events.last().map(AuditEvent::checkpoint),
+        )
+        .map_err(|_| AuditReadError::Invariant)?;
+        let snapshot = request.snapshot.unwrap_or(selected);
+        if let Some(expected) = request.snapshot {
+            let matches = expected.event_count() == 0
+                || usize::try_from(expected.event_count())
+                    .ok()
+                    .and_then(|count| count.checked_sub(1))
+                    .and_then(|index| events.get(index))
+                    .map(AuditEvent::checkpoint)
+                    == expected.head();
+            if !matches {
+                return Err(AuditReadError::SnapshotChanged);
+            }
+        }
+        let start =
+            usize::try_from(request.after_sequence).map_err(|_| AuditReadError::Invariant)?;
+        let end = usize::try_from(snapshot.event_count()).map_err(|_| AuditReadError::Invariant)?;
+        if start > end || end > events.len() {
+            return Err(AuditReadError::SnapshotChanged);
+        }
+        if start > 0 && events.get(start - 1).is_none() {
+            return Err(AuditReadError::SnapshotChanged);
+        }
+        let limit = usize::try_from(request.limit).map_err(|_| AuditReadError::Invariant)?;
+        let page = events[start..end]
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(AuditStoredPage {
+            snapshot,
+            has_more: start.saturating_add(page.len()) < end,
+            events: page,
+        })
     }
 }
 
@@ -574,6 +622,7 @@ impl Adapters for Fakes {
     type Integrity = Fake;
     type Documents = Fake;
     type Exchanges = Fake;
+    type AuditEvents = Fake;
     type Clock = Fake;
 
     fn identity(&self) -> &Fake {
@@ -597,6 +646,9 @@ impl Adapters for Fakes {
     fn exchanges(&self) -> &Fake {
         &self.0
     }
+    fn audit_events(&self) -> &Fake {
+        &self.0
+    }
     fn clock(&self) -> &Fake {
         &self.0
     }
@@ -607,7 +659,12 @@ fn application() -> Application<Fakes> {
 }
 
 fn application_with(limits: Limits) -> Application<Fakes> {
-    Application::new(Fakes(Fake::new()), limits)
+    let fake = Fake::new();
+    let public_key = fake.public_key().expect("public key");
+    let proof = AuditPublicKey::new(public_key, AuditKeyPin::new(sha256(&public_key)))
+        .expect("matching pin");
+    let audit = AuditSettings::new(proof, limits.audit_events, 100).expect("audit settings");
+    Application::new(Fakes(fake), limits, audit)
 }
 
 fn fake(application: &Application<Fakes>) -> &Fake {
@@ -1200,6 +1257,292 @@ fn audit_beyond_the_event_limit_is_incomplete_without_a_head() {
     assert_eq!(
         block_on(application.verify_audit(&Actor::Auditor, None)),
         Err(ApplicationError::AuditIncomplete)
+    );
+}
+
+#[test]
+fn publishes_only_the_pinned_audit_public_key_to_auditors() {
+    let application = application();
+    for caller in [actor(SENDER), Actor::Operator] {
+        assert_eq!(
+            application.audit_public_key(&caller),
+            Err(ApplicationError::Forbidden)
+        );
+    }
+    let proof = application
+        .audit_public_key(&Actor::Auditor)
+        .expect("auditor proof");
+    assert_eq!(proof.public_key(), [42; 32]);
+    assert_eq!(proof.fingerprint().as_bytes(), sha256(&[42; 32]));
+    assert_eq!(format!("{proof:?}"), "AuditPublicKey(redacted)");
+    assert!(AuditPublicKey::new([42; 32], AuditKeyPin::new([0; 32])).is_err());
+}
+
+/// Delivers and accepts one copy, leaving two events.
+fn two_events(application: &Application<Fakes>) {
+    let delivered = block_on(application.send_copy(&actor(SENDER), command())).expect("delivery");
+    block_on(application.accept(
+        &actor(RECIPIENT),
+        &delivered.exchange_id,
+        &key("idem_accept0000000001"),
+    ))
+    .expect("acceptance");
+}
+
+fn start(challenge: u8, limit: Option<u32>) -> AuditExportRequest {
+    AuditExportRequest::start(AuditChallenge::new([challenge; 32]), limit).expect("bounded start")
+}
+
+fn next_page(
+    application: &Application<Fakes>,
+    page: &AuditExportPage,
+    limit: Option<u32>,
+) -> Result<AuditExportPage, ApplicationError> {
+    block_on(
+        application.export_audit_events(
+            &Actor::Auditor,
+            AuditExportRequest::continuation(
+                page.manifest,
+                page.manifest_signature,
+                page.next_after_sequence.expect("partial page"),
+                limit,
+            )
+            .expect("bounded continuation"),
+        ),
+    )
+}
+
+#[test]
+fn exports_challenge_bound_snapshot_pages_only_to_auditors() {
+    let application = application();
+    let pin = sha256(&[42; 32]);
+
+    // An empty chain is one complete page with a signed manifest and no head.
+    let empty = block_on(application.export_audit_events(&Actor::Auditor, start(6, None)))
+        .expect("empty export");
+    assert_eq!(
+        (
+            empty.coverage,
+            empty.events.len(),
+            empty.next_after_sequence
+        ),
+        (Coverage::Complete, 0, None)
+    );
+    assert_eq!(empty.manifest.snapshot().head(), None);
+
+    two_events(&application);
+    for caller in [actor(SENDER), actor(RECIPIENT), Actor::Operator] {
+        assert_eq!(
+            block_on(application.export_audit_events(&caller, start(7, Some(1)))),
+            Err(ApplicationError::Forbidden)
+        );
+    }
+    let first = block_on(application.export_audit_events(&Actor::Auditor, start(7, Some(1))))
+        .expect("first page");
+    assert_eq!((first.coverage, first.events.len()), (Coverage::Partial, 1));
+    assert_eq!(first.next_after_sequence, Some(1));
+    assert_eq!(first.manifest.challenge(), AuditChallenge::new([7; 32]));
+    assert_eq!(first.manifest.audit_key_fingerprint(), pin);
+    assert_eq!(first.manifest.snapshot().event_count(), 2);
+    assert!(
+        fake(&application)
+            .verify(
+                &first.manifest.signature_input_v1(),
+                &first.manifest_signature
+            )
+            .is_ok()
+    );
+    let stored = fake(&application).events.lock().expect("events").clone();
+    let event = &first.events[0];
+    assert_eq!(event.preimage_version, 1);
+    assert_eq!(event.preimage, stored[0].preimage_v1().expect("preimage"));
+    assert_eq!(sha256(&event.preimage), stored[0].event_hash);
+    assert_eq!(
+        (event.sequence, event.previous_event_hash, event.event_hash),
+        (1, [0; 32], stored[0].event_hash)
+    );
+    assert_eq!(format!("{first:?}"), "AuditExportPage(redacted)");
+
+    // An event appended between pages stays outside the selected snapshot.
+    let mut later = command();
+    later.idempotency_key = key("idem_0000000000000009");
+    later.request_nonce = RequestNonce::new([9; 16]);
+    later.document_version = DocumentVersion::new(2).expect("version");
+    block_on(application.send_copy(&actor(SENDER), later)).expect("append");
+    let second = next_page(&application, &first, Some(1)).expect("second page");
+    assert_eq!(
+        (
+            second.coverage,
+            second.events.len(),
+            second.next_after_sequence
+        ),
+        (Coverage::Complete, 1, None)
+    );
+    assert_eq!(second.events[0].sequence, 2);
+    assert_eq!(second.events[0].previous_event_hash, stored[0].event_hash);
+    assert_eq!(second.manifest, first.manifest);
+    assert_eq!(second.manifest_signature, first.manifest_signature);
+
+    // Without a limit the configured default applies.
+    let whole = block_on(application.export_audit_events(&Actor::Auditor, start(8, None)))
+        .expect("default page size");
+    assert_eq!(
+        (whole.coverage, whole.events.len()),
+        (Coverage::Complete, 3)
+    );
+}
+
+#[test]
+fn audit_export_fails_closed_on_manifest_pagination_and_total_bounds() {
+    for limit in [0, 501] {
+        assert_eq!(
+            AuditExportRequest::start(AuditChallenge::new([1; 32]), Some(limit)),
+            Err(ApplicationError::InvalidRequest)
+        );
+    }
+    let application = application();
+    two_events(&application);
+    let first = block_on(application.export_audit_events(&Actor::Auditor, start(2, Some(1))))
+        .expect("first page");
+    for (after, limit) in [
+        (0, None),
+        (2, None),
+        (3, None),
+        (1, Some(0)),
+        (1, Some(501)),
+    ] {
+        assert_eq!(
+            AuditExportRequest::continuation(
+                first.manifest,
+                first.manifest_signature,
+                after,
+                limit
+            ),
+            Err(ApplicationError::InvalidRequest),
+            "{after}/{limit:?}"
+        );
+    }
+
+    // A manifest this key did not sign, or one naming another key, is refused before any read.
+    let mut bad_signature = first.clone();
+    bad_signature.manifest_signature[0] ^= 1;
+    // Reusing a signed manifest under another challenge does not verify.
+    let mut rechallenged = first.clone();
+    rechallenged.manifest = AuditExportManifest::new(
+        AuditChallenge::new([9; 32]),
+        first.manifest.audit_key_fingerprint(),
+        first.manifest.snapshot(),
+    );
+    let mut foreign = first.clone();
+    foreign.manifest = AuditExportManifest::new(
+        first.manifest.challenge(),
+        [3; 32],
+        first.manifest.snapshot(),
+    );
+    foreign.manifest_signature = fake(&application)
+        .sign(&foreign.manifest.signature_input_v1())
+        .expect("signature");
+    for page in [&bad_signature, &rechallenged, &foreign] {
+        assert_eq!(
+            next_page(&application, page, Some(1)),
+            Err(ApplicationError::InvalidRequest)
+        );
+    }
+
+    // A snapshot whose head no longer holds fails closed rather than returning a prefix.
+    let removed = fake(&application).events.lock().expect("events").pop();
+    assert!(removed.is_some());
+    assert_eq!(
+        next_page(&application, &first, Some(1)),
+        Err(ApplicationError::IntegrityFailure)
+    );
+    fake(&application)
+        .events
+        .lock()
+        .expect("events")
+        .extend(removed);
+
+    // A stored event whose signature or link fails is never exported.
+    let original = fake(&application).events.lock().expect("events")[0].clone();
+    fake(&application).events.lock().expect("events")[0].signature[0] ^= 1;
+    assert_eq!(
+        block_on(application.export_audit_events(&Actor::Auditor, start(4, None))),
+        Err(ApplicationError::IntegrityFailure)
+    );
+    fake(&application).events.lock().expect("events")[0] = original;
+    fake(&application).events.lock().expect("events")[1].previous_hash[0] ^= 1;
+    assert_eq!(
+        block_on(application.export_audit_events(&Actor::Auditor, start(4, None))),
+        Err(ApplicationError::IntegrityFailure)
+    );
+
+    // Beyond the configured total there is no page and no head, for a start or a continuation.
+    let limited = application_with(Limits {
+        audit_events: 1,
+        ..Limits::default()
+    });
+    two_events(&limited);
+    assert_eq!(
+        block_on(limited.export_audit_events(&Actor::Auditor, start(3, None))),
+        Err(ApplicationError::AuditIncomplete)
+    );
+    let unlimited = application_with(Limits::default());
+    two_events(&unlimited);
+    let signed = block_on(unlimited.export_audit_events(&Actor::Auditor, start(3, Some(1))))
+        .expect("signed elsewhere");
+    assert_eq!(
+        next_page(&limited, &signed, Some(1)),
+        Err(ApplicationError::AuditIncomplete)
+    );
+}
+
+#[test]
+fn audit_export_start_over_tampered_head_signature_fails_and_signs_nothing() {
+    let application = application();
+    two_events(&application);
+    // With one event per page the first page never reaches the head, so only the start's own
+    // check stands between a tampered head and a signed manifest naming it.
+    fake(&application).events.lock().expect("events")[1].signature[0] ^= 1;
+    let signed_before = fake(&application).signatures.load(Ordering::SeqCst);
+    assert_eq!(
+        block_on(application.export_audit_events(&Actor::Auditor, start(5, Some(1)))),
+        Err(ApplicationError::IntegrityFailure)
+    );
+    assert_eq!(
+        fake(&application).signatures.load(Ordering::SeqCst),
+        signed_before
+    );
+}
+
+#[test]
+fn audit_export_partition_boundaries_cover_each_sequence_once() {
+    for count in [0_u64, 1, 499, 500, 501, 100_000] {
+        for limit in [1_u32, 100, 500] {
+            let mut after = 0_u64;
+            let mut covered = Vec::new();
+            loop {
+                let last = after.saturating_add(u64::from(limit)).min(count);
+                let returned = usize::try_from(last - after).expect("bounded page length");
+                let has_more = last < count;
+                let (coverage, next) =
+                    page_markers(count, last, returned, has_more, limit).expect("valid partition");
+                covered.extend((after + 1)..=last);
+                match (coverage, next) {
+                    (Coverage::Partial, Some(cursor)) => after = cursor,
+                    (Coverage::Complete, None) => break,
+                    markers => panic!("invalid markers: {markers:?}"),
+                }
+            }
+            assert_eq!(covered, (1..=count).collect::<Vec<_>>(), "{count}/{limit}");
+        }
+    }
+    assert_eq!(
+        page_markers(2, 1, 0, true, 1),
+        Err(ApplicationError::IntegrityFailure)
+    );
+    assert_eq!(
+        page_markers(2, 1, 1, false, 1),
+        Err(ApplicationError::IntegrityFailure)
     );
 }
 

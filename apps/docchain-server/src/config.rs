@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use thiserror::Error;
 
 /// A secret value whose debug representation never reveals the value.
@@ -39,6 +40,8 @@ pub struct Settings {
     pub document_store_root: PathBuf,
     /// Mock provider key files.
     pub keys: KeySettings,
+    /// Audit export bounds.
+    pub audit: AuditSettings,
     /// Mock identity credential file.
     pub identity_credentials_file: PathBuf,
 }
@@ -105,6 +108,16 @@ pub struct KeySettings {
     pub(crate) wallet_signing_private: Vec<PathBuf>,
     pub(crate) wallet_encryption_private: Vec<PathBuf>,
     pub(crate) audit_private: PathBuf,
+    pub(crate) audit_public_key_fingerprint: [u8; 32],
+}
+
+/// Bounded independent-audit export settings.
+#[derive(Clone, Copy, Debug)]
+pub struct AuditSettings {
+    /// Maximum event count for a complete export.
+    pub max_export_events: u32,
+    /// Default number of events per page.
+    pub default_page_size: u32,
 }
 
 impl fmt::Debug for Settings {
@@ -115,6 +128,7 @@ impl fmt::Debug for Settings {
             .field("http", &self.http)
             .field("document_store_root", &"redacted")
             .field("keys", &self.keys)
+            .field("audit", &self.audit)
             .field("identity_credentials_file", &"redacted")
             .finish()
     }
@@ -277,6 +291,36 @@ impl Settings {
             ));
         }
 
+        let audit_public_key_fingerprint = decode_b64_32(
+            get("DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT").ok_or(SettingsError::new(
+                "DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT",
+                "is required",
+            ))?,
+            "DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT",
+        )?;
+        let max_export_events = parse_or(
+            get("DOCCHAIN_AUDIT__MAX_EXPORT_EVENTS"),
+            100_000_u32,
+            "DOCCHAIN_AUDIT__MAX_EXPORT_EVENTS",
+        )?;
+        if !(1..=100_000).contains(&max_export_events) {
+            return Err(SettingsError::new(
+                "DOCCHAIN_AUDIT__MAX_EXPORT_EVENTS",
+                "must be from 1 through 100000",
+            ));
+        }
+        let default_page_size = parse_or(
+            get("DOCCHAIN_AUDIT__DEFAULT_PAGE_SIZE"),
+            100_u32,
+            "DOCCHAIN_AUDIT__DEFAULT_PAGE_SIZE",
+        )?;
+        if !(1..=500).contains(&default_page_size) {
+            return Err(SettingsError::new(
+                "DOCCHAIN_AUDIT__DEFAULT_PAGE_SIZE",
+                "must be from 1 through 500",
+            ));
+        }
+
         Ok(Self {
             database: DatabaseSettings {
                 host,
@@ -315,6 +359,11 @@ impl Settings {
                     get("DOCCHAIN_KEYS__AUDIT_PRIVATE_KEY_FILE"),
                     "DOCCHAIN_KEYS__AUDIT_PRIVATE_KEY_FILE",
                 )?,
+                audit_public_key_fingerprint,
+            },
+            audit: AuditSettings {
+                max_export_events,
+                default_page_size,
             },
             identity_credentials_file: required_path(
                 get("DOCCHAIN_IDENTITY__CREDENTIALS_FILE"),
@@ -322,6 +371,27 @@ impl Settings {
             )?,
         })
     }
+}
+
+fn decode_b64_32(value: &str, key: &'static str) -> Result<[u8; 32], SettingsError> {
+    if value.contains('=') || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(SettingsError::new(
+            key,
+            "must be canonical unpadded base64url",
+        ));
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| SettingsError::new(key, "must be canonical unpadded base64url"))?;
+    if URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return Err(SettingsError::new(
+            key,
+            "must be canonical unpadded base64url",
+        ));
+    }
+    decoded
+        .try_into()
+        .map_err(|_| SettingsError::new(key, "must encode exactly 32 bytes"))
 }
 
 fn parse_or<T: std::str::FromStr>(
@@ -395,11 +465,13 @@ mod tests {
         assert_eq!(settings.http.max_in_flight, 64);
         assert_eq!(settings.http.shutdown_timeout, Duration::from_secs(10));
         assert_eq!(settings.keys.wallet_encryption_private.len(), 1);
+        assert_eq!(settings.audit.max_export_events, 100_000);
+        assert_eq!(settings.audit.default_page_size, 100);
     }
 
     #[test]
     fn each_missing_or_unsafe_value_names_its_key() {
-        let cases: [(&str, Option<&str>); 14] = [
+        let cases: [(&str, Option<&str>); 18] = [
             ("DOCCHAIN_DOCUMENT_STORE__ROOT", None),
             ("DOCCHAIN_DOCUMENT_STORE__ROOT", Some("relative/documents")),
             ("DOCCHAIN_DOCUMENT_STORE__ROOT", Some("/")),
@@ -408,6 +480,10 @@ mod tests {
             ("DOCCHAIN_KEYS__WALLET_SIGNING_PRIVATE_KEY_FILES", Some(",")),
             ("DOCCHAIN_KEYS__WALLET_ENCRYPTION_PRIVATE_KEY_FILES", None),
             ("DOCCHAIN_KEYS__AUDIT_PRIVATE_KEY_FILE", None),
+            ("DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT", None),
+            ("DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT", Some("AA==")),
+            ("DOCCHAIN_AUDIT__MAX_EXPORT_EVENTS", Some("100001")),
+            ("DOCCHAIN_AUDIT__DEFAULT_PAGE_SIZE", Some("501")),
             ("DOCCHAIN_IDENTITY__CREDENTIALS_FILE", None),
             ("DOCCHAIN_DATABASE__PASSWORD", Some("")),
             ("DOCCHAIN_DATABASE__MAX_CONNECTIONS", Some("65")),
@@ -524,6 +600,10 @@ mod tests {
         ] {
             values.insert(key.to_owned(), format!("/private/{key}"));
         }
+        values.insert(
+            "DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT".to_owned(),
+            URL_SAFE_NO_PAD.encode([1; 32]),
+        );
         values
     }
 }

@@ -61,6 +61,9 @@ values are supplied as mounted files. The settings are:
 | `DOCCHAIN_KEYS__WALLET_SIGNING_PRIVATE_KEY_FILES` | Required comma-separated wallet signing-key files |
 | `DOCCHAIN_KEYS__WALLET_ENCRYPTION_PRIVATE_KEY_FILES` | Required comma-separated wallet encryption-key files |
 | `DOCCHAIN_KEYS__AUDIT_PRIVATE_KEY_FILE` | Required audit signing-key file |
+| `DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT` | Required canonical base64url SHA-256 fingerprint, provisioned separately |
+| `DOCCHAIN_AUDIT__MAX_EXPORT_EVENTS` | `100000` (accepted range 1 to 100000) |
+| `DOCCHAIN_AUDIT__DEFAULT_PAGE_SIZE` | `100` (accepted range 1 to 500) |
 
 A missing or malformed setting stops startup with a message that names the variable but never its
 value. `PGOPTIONS` is refused so it cannot override the configured schema. PostgreSQL TLS variables
@@ -88,20 +91,65 @@ PostgreSQL responds and the document-store root was proven writable within the l
 answers every readiness check for one second.
 
 Every API request carries `Authorization: Bearer <credential>`, verified against the configured
-credential file; no other header selects a wallet or role. `GET /v1/audit/verify` returns the verified
-signed chain head. An auditor who presents a head it verified earlier, as `head_sequence`,
-`head_event_hash`, and `head_signature` query parameters, is told when events after it have gone.
-A chain longer than 100,000 events returns `503` with the category `audit-incomplete` rather than a
-verdict for part of it. Accepting an exchange returns only that exchange's ID and `credit_awarded: 1`.
-Reading a document checks the sender's and reader's keys as they stood when the copy was sent, so a
-key revocation that takes effect later leaves earlier copies readable.
+credential file; no other header selects a wallet or role.
+
+`GET /v1/audit/verify` returns the server-verified signed chain head. An auditor who presents a head
+it verified earlier, as `head_sequence`, `head_event_hash`, and `head_signature` query parameters,
+is told when events after it have gone. A first call establishes a baseline only, because the
+service that answers holds the audit key. A chain longer than 100,000 events returns `503` with the
+category `audit-incomplete` rather than a verdict for part of it. Accepting an exchange returns only
+that exchange's ID and `credit_awarded: 1`. Reading a document checks the sender's and reader's keys
+as they stood when the copy was sent, so a key revocation that takes effect later leaves earlier
+copies readable.
 
 The command reproduces the byte-exact version 1 envelope vector, then runs the system tests one at a
-time. Together they cover delivery, acceptance, replay protection, schema rejection, privacy, and
-integrity. Each test creates its own database schema and temporary document-store root under `TMPDIR`,
-reads the database coordinates from the `DOCCHAIN_DATABASE__*` variables or, failing those, from
-`POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD_FILE`, and never starts, stops, resets, or
-deletes the PostgreSQL service.
+time. Together they cover delivery, acceptance, replay protection, schema rejection, privacy,
+integrity, and independent audit. Each test creates its own database schema and temporary
+document-store root under `TMPDIR`, reads the database coordinates from the `DOCCHAIN_DATABASE__*`
+variables or, failing those, from `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD_FILE`, and
+never starts, stops, resets, or deletes the PostgreSQL service.
+
+### Independent audit
+
+The audit fingerprint is the unpadded base64url encoding of the SHA-256 digest of the 32-byte
+Ed25519 public key that belongs to the audit signing key. Before a demonstration, the product owner
+approves that one value and hands it separately to the server operator, as
+`DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT`, and to the auditor, as an input to the auditor's own
+verifier. The server derives the fingerprint of its loaded key and refuses to start, before it binds
+its listener, when the two differ. The auditor never learns the expected value from the service and
+never trusts a fingerprint on first use.
+
+Only the auditor credential is served by these operations; any other credential receives `403
+forbidden`. Every response from them, success or error, carries `Cache-Control: no-store`, and all
+proof travels in response and request bodies, never the request target.
+
+- `GET /v1/audit/key` takes no query and no body and returns exactly `public_key` and
+  `fingerprint`, both unpadded base64url. The auditor checks both against its separately provisioned
+  fingerprint.
+- `POST /v1/audit/events/export` takes no query and a JSON body of at most 4 KiB and depth four.
+  The first request is `{"challenge": <32 fresh random bytes the auditor generated and keeps>,
+  "limit": <optional, 1 to 500>}`. The service selects the current chain snapshot and returns a
+  `manifest` (`export_version`, `challenge`, `audit_key_fingerprint`, `event_count`, and the signed
+  `head`, or `null` for an empty chain), the audit key's `manifest_signature` over it, `coverage`,
+  up to `limit` `events`, and `next_after_sequence`. Each event holds `preimage_version` `1`, the
+  exact `preimage` bytes its `event_hash` digests, `sequence`, `previous_event_hash`, `event_hash`,
+  and `signature`. To continue, send `{"manifest", "manifest_signature", "after_sequence", "limit"}`
+  with the manifest and signature unchanged and `after_sequence` set to the previous
+  `next_after_sequence`. Every page repeats the same manifest; events appended after the first
+  page are not part of the export. Only the page that ends at `event_count` says
+  `coverage: "complete"` with `next_after_sequence: null`; every earlier page says `"partial"`.
+- An unknown, duplicated, malformed, or out-of-bound request member returns `422 invalid-request`,
+  including a manifest this key did not sign. A snapshot that changed underneath a continuation
+  returns `409 integrity-failure`. A chain longer than `DOCCHAIN_AUDIT__MAX_EXPORT_EVENTS` returns
+  `503 audit-incomplete` with no page.
+
+The auditor verifies offline, from those bytes, its own challenge, and its provisioned fingerprint:
+the manifest signature and challenge, the unchanged manifest on every page, contiguous sequences from
+1, each preimage's hash, embedded sequence and previous hash, and each event signature, and that the
+final page reaches the signed head. The first complete export is a baseline only. A later export
+detects rollback at or before the newest checkpoint the auditor retained from an earlier verified
+export. Neither proves absolute freshness, nor that the key holder showed every auditor the same
+snapshot.
 
 ## Layout
 

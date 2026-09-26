@@ -4,9 +4,14 @@
 use std::sync::Arc;
 
 use docchain_application::{
-    AcceptanceResult, Actor, Adapters, Application, ApplicationError, AuditReport, Credential,
-    Delivery, Limits, SendCopyCommand,
+    AcceptanceResult, Actor, Adapters, Application, ApplicationError, AuditExportPage,
+    AuditExportRequest, AuditKeyPin, AuditPublicKey, AuditReport, AuditSettings, Credential,
+    Delivery, EventIntegrity as _, Limits, SendCopyCommand,
 };
+#[cfg(feature = "test-support")]
+use docchain_application::{AuditEventStore as _, AuditReadRequest};
+#[cfg(feature = "test-support")]
+use docchain_domain::sha256;
 use docchain_domain::{Checkpoint, ExchangeId, IdempotencyKey, WalletId};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use thiserror::Error;
@@ -40,6 +45,7 @@ impl Adapters for ServerAdapters {
     type Integrity = AuditKey;
     type Documents = FileDocumentStore;
     type Exchanges = PgExchangeStore;
+    type AuditEvents = PgExchangeStore;
     type Clock = SystemClock;
 
     fn identity(&self) -> &Self::Identity {
@@ -61,6 +67,9 @@ impl Adapters for ServerAdapters {
         &self.documents
     }
     fn exchanges(&self) -> &Self::Exchanges {
+        &self.exchanges
+    }
+    fn audit_events(&self) -> &Self::AuditEvents {
         &self.exchanges
     }
     fn clock(&self) -> &Self::Clock {
@@ -162,6 +171,22 @@ impl DocchainService {
             .map_err(|_| ServiceError::Initialization("wallet signing key files"))?;
         let encryption = load_key_files(&settings.keys.wallet_encryption_private)
             .map_err(|_| ServiceError::Initialization("wallet encryption key files"))?;
+        let integrity = AuditKey::load(&settings.keys.audit_private)
+            .map_err(|_| ServiceError::Initialization("audit key file"))?;
+        let public_key = integrity
+            .public_key()
+            .map_err(|_| ServiceError::Initialization("audit public key"))?;
+        let public_proof = AuditPublicKey::new(
+            public_key,
+            AuditKeyPin::new(settings.keys.audit_public_key_fingerprint),
+        )
+        .map_err(|_| ServiceError::Initialization("audit public key fingerprint"))?;
+        let audit = AuditSettings::new(
+            public_proof,
+            settings.audit.max_export_events,
+            settings.audit.default_page_size,
+        )
+        .map_err(|_| ServiceError::Initialization("audit settings"))?;
         let adapters = ServerAdapters {
             identity: FileIdentity::load(&settings.identity_credentials_file)
                 .map_err(|_| ServiceError::Initialization("identity credentials file"))?,
@@ -170,8 +195,7 @@ impl DocchainService {
                 .map_err(|_| ServiceError::Initialization("key-binding registry"))?,
             crypto: CryptoEngine::new(signing, encryption)
                 .map_err(|_| ServiceError::Initialization("wallet key material"))?,
-            integrity: AuditKey::load(&settings.keys.audit_private)
-                .map_err(|_| ServiceError::Initialization("audit key file"))?,
+            integrity,
             documents: FileDocumentStore::new(settings.document_store_root.clone())
                 .await
                 .map_err(|_| ServiceError::Initialization("document store root"))?,
@@ -179,7 +203,7 @@ impl DocchainService {
             clock: SystemClock,
         };
         Ok(Self {
-            application: Application::new(adapters, limits),
+            application: Application::new(adapters, limits, audit),
         })
     }
 
@@ -258,6 +282,23 @@ impl DocchainService {
             .map_err(Into::into)
     }
 
+    /// Returns the pinned public audit proof to an authorized auditor.
+    pub fn audit_public_key(&self, actor: &Actor) -> Result<AuditPublicKey, ServiceError> {
+        self.application.audit_public_key(actor).map_err(Into::into)
+    }
+
+    /// Selects or continues a bounded independent audit export.
+    pub async fn export_audit_events(
+        &self,
+        actor: &Actor,
+        request: AuditExportRequest,
+    ) -> Result<AuditExportPage, ServiceError> {
+        self.application
+            .export_audit_events(actor, request)
+            .await
+            .map_err(Into::into)
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn pool(&self) -> &sqlx::PgPool {
         self.application.adapters().exchanges.pool()
@@ -299,6 +340,8 @@ pub(crate) struct FixtureFiles {
     pub(crate) root: std::path::PathBuf,
     pub(crate) object_root: std::path::PathBuf,
     pub(crate) settings: Settings,
+    /// Verifier-side copy of the product-owner trust anchor, separate from server settings.
+    expected_audit_fingerprint: [u8; 32],
     /// Every `DOCCHAIN_` variable the settings came from.
     environment: Vec<(String, String)>,
     credentials: [String; 6],
@@ -413,6 +456,13 @@ impl FixtureFiles {
             &root.join("audit.key"),
             &URL_SAFE_NO_PAD.encode(sequential(0xb0)),
         )?;
+        let audit_key = AuditKey::load(&root.join("audit.key"))
+            .map_err(|_| ServiceError::Initialization("test fixture"))?;
+        let audit_public_key = audit_key
+            .public_key()
+            .map_err(|_| ServiceError::Initialization("test fixture"))?;
+        let expected_audit_fingerprint = sha256(&audit_public_key);
+        let audit_fingerprint = URL_SAFE_NO_PAD.encode(expected_audit_fingerprint);
         let sender_credential = "synthetic-sender-credential".to_owned();
         let recipient_credential = "synthetic-recipient-credential".to_owned();
         let unrelated_credential = "synthetic-unrelated-credential".to_owned();
@@ -495,6 +545,10 @@ impl FixtureFiles {
                 root.join("audit.key").display().to_string(),
             ),
             (
+                "DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT",
+                audit_fingerprint,
+            ),
+            (
                 "DOCCHAIN_IDENTITY__CREDENTIALS_FILE",
                 root.join("identities.json").display().to_string(),
             ),
@@ -514,6 +568,7 @@ impl FixtureFiles {
             root,
             object_root,
             settings,
+            expected_audit_fingerprint,
             environment,
             credentials: [
                 sender_credential,
@@ -719,6 +774,21 @@ impl DemoHarness {
         let actor = self.actor(&self.auditor_credential).await?;
         self.service.verify_audit(&actor, expected).await
     }
+    /// The fixture-owned trust anchor supplied independently of any HTTP response.
+    pub fn expected_audit_fingerprint(&self) -> [u8; 32] {
+        self.fixture.expected_audit_fingerprint
+    }
+    pub async fn audit_public_key(&self) -> Result<AuditPublicKey, ServiceError> {
+        let actor = self.actor(&self.auditor_credential).await?;
+        self.service.audit_public_key(&actor)
+    }
+    pub async fn export_audit_events(
+        &self,
+        request: AuditExportRequest,
+    ) -> Result<AuditExportPage, ServiceError> {
+        let actor = self.actor(&self.auditor_credential).await?;
+        self.service.export_audit_events(&actor, request).await
+    }
     pub async fn stats(&self) -> Result<StateStats, ServiceError> {
         let pool = self.service.pool();
         let delivered = sqlx::query_scalar("SELECT COUNT(*) FROM exchanges")
@@ -779,14 +849,47 @@ impl DemoHarness {
             .map_err(|_| ServiceError::Inspection)
     }
     pub async fn audit_events(&self) -> Result<Vec<docchain_domain::AuditEvent>, ServiceError> {
-        use docchain_application::ExchangeStore as _;
-        self.service
+        let mut page = self
+            .service
             .application
             .adapters()
             .exchanges
-            .events(100_000)
+            .page(AuditReadRequest {
+                snapshot: None,
+                after_sequence: 0,
+                limit: 500,
+            })
             .await
-            .map_err(|_| ServiceError::Inspection)
+            .map_err(|_| ServiceError::Inspection)?;
+        let snapshot = page.snapshot;
+        let mut events = Vec::new();
+        loop {
+            let has_more = page.has_more;
+            let progressed = !page.events.is_empty();
+            events.extend(page.events);
+            if !has_more {
+                return Ok(events);
+            }
+            if !progressed {
+                return Err(ServiceError::Inspection);
+            }
+            let after_sequence = events
+                .last()
+                .map(|event| event.sequence)
+                .ok_or(ServiceError::Inspection)?;
+            page = self
+                .service
+                .application
+                .adapters()
+                .exchanges
+                .page(AuditReadRequest {
+                    snapshot: Some(snapshot),
+                    after_sequence,
+                    limit: 500,
+                })
+                .await
+                .map_err(|_| ServiceError::Inspection)?;
+        }
     }
     pub async fn alter_envelope(&self, exchange: &ExchangeId) -> Result<(), ServiceError> {
         let object: String =
@@ -970,6 +1073,17 @@ mod tests {
 
     async fn exists(options: PgConnectOptions, schema: &str) -> Option<bool> {
         schema_exists(options, schema).await.ok()
+    }
+
+    #[tokio::test]
+    async fn composition_rejects_a_mismatched_audit_public_key_pin() {
+        let mut fixture = FixtureFiles::write().expect("fixture");
+        fixture.create_schema().await.expect("schema");
+        fixture.settings.keys.audit_public_key_fingerprint = [0; 32];
+        assert!(matches!(
+            DocchainService::compose(&fixture.settings).await,
+            Err(ServiceError::Initialization("audit public key fingerprint"))
+        ));
     }
 
     #[tokio::test]

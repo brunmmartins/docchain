@@ -15,7 +15,7 @@ change one, change the other in the same commit.
 | `just lint` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | While editing |
 | `just check-fast` | `cargo fmt --all --check`, then `cargo check --workspace --all-targets`, then `cargo test --workspace --lib` | While editing |
 | `just test` | `cargo nextest run --workspace --all-features --no-tests=warn`, or `cargo test --workspace --all-features --all-targets` without nextest; then `cargo test --doc --workspace --all-features` | Before committing |
-| `just demo-first-slice` | Enables the non-default `test-support` feature, runs `envelope_vectors`, then the six PostgreSQL and filesystem system-test targets serially with `cargo test -p docchain-server` | To run the complete invented exchange |
+| `just demo-first-slice` | Enables the non-default `test-support` feature, runs `envelope_vectors`, then the seven PostgreSQL and filesystem system-test targets serially with `cargo test -p docchain-server` | To run the complete invented exchange and independent audit |
 | `just docs` | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps` | When public docs change; add `--open` to browse |
 | `just deny` | `cargo deny check` | When dependencies change |
 | `just check` | `cargo fmt --all --check`, then `just lint test docs deny` | Before proposing a change |

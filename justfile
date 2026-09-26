@@ -70,7 +70,7 @@ test:
 demo-first-slice:
     cargo test {{locked}} -p docchain-server --features test-support --test envelope_vectors
     cargo test {{locked}} -p docchain-server --features test-support --test send_copy --test acceptance --test replay \
-        --test schema_rejection --test privacy --test integrity -- --test-threads=1
+        --test schema_rejection --test privacy --test integrity --test independent_audit -- --test-threads=1
 
 # Build API documentation; broken intra-doc links fail
 docs:

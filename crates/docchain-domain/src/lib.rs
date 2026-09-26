@@ -8,8 +8,9 @@ mod time;
 mod types;
 
 pub use event::{
-    AuditEvent, Checkpoint, EventDraft, EventKind, envelope_commitment, event_signature_input,
-    sha256, verify_event_chain,
+    AUDIT_PREIMAGE_VERSION, AuditChallenge, AuditEvent, AuditExportManifest, AuditSnapshot,
+    Checkpoint, EventDraft, EventKind, envelope_commitment, event_signature_input, sha256,
+    verify_event_chain,
 };
 pub use json::{CanonicalDocument, canonicalize, parse_bounded_json, parse_document};
 pub use schema::CompiledSchema;

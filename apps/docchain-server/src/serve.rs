@@ -41,7 +41,8 @@ pub enum ServeError {
 /// connections close; and admitted requests get `deadline` to finish. Requests still running at the
 /// deadline are cancelled: their handler futures are dropped, so an open transaction rolls back,
 /// and the client receives the `503` `dependency-failure` Problem if its connection is still
-/// writable. Nothing reads standard input.
+/// writable, with `Cache-Control: no-store` on the audit proof routes. Nothing reads standard
+/// input.
 ///
 /// # Errors
 ///
@@ -63,7 +64,11 @@ where
     S: Future<Output = ()> + Send + 'static,
 {
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let application = application.layer(middleware::from_fn_with_state(cancel_rx, cancellable));
+    // `no_store` wraps the cancellation so the shutdown 503 on an audit proof route is also
+    // uncacheable; the router's own `no_store` cannot see a response produced outside it.
+    let application = application
+        .layer(middleware::from_fn_with_state(cancel_rx, cancellable))
+        .layer(middleware::from_fn(crate::http::no_store));
     let (drain_tx, drain_rx) = oneshot::channel::<()>();
     let mut server: JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
         axum::serve(listener, application)
@@ -125,7 +130,10 @@ mod tests {
         },
     };
 
-    use axum::{extract::State, routing::get};
+    use axum::{
+        extract::State,
+        routing::{MethodRouter, get, post},
+    };
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpStream,
@@ -156,22 +164,24 @@ mod tests {
         }
     }
 
+    /// A handler that answers only when released and records whether it was dropped first.
+    async fn held(State(gate): State<Gate>) -> &'static str {
+        let mut unfinished = Unfinished {
+            cancelled: Arc::clone(&gate.cancelled),
+            finished: false,
+        };
+        gate.entered.notify_one();
+        gate.release.notified().await;
+        unfinished.finished = true;
+        "held"
+    }
+
     fn application(gate: Gate) -> Router {
+        let held_export: MethodRouter<Gate> = post(held);
         Router::new()
             .route("/quick", get(|| async { "quick" }))
-            .route(
-                "/held",
-                get(|State(gate): State<Gate>| async move {
-                    let mut unfinished = Unfinished {
-                        cancelled: Arc::clone(&gate.cancelled),
-                        finished: false,
-                    };
-                    gate.entered.notify_one();
-                    gate.release.notified().await;
-                    unfinished.finished = true;
-                    "held"
-                }),
-            )
+            .route("/held", get(held))
+            .route(crate::http::AUDIT_EXPORT_ROUTE, held_export)
             .with_state(gate)
     }
 
@@ -210,11 +220,19 @@ mod tests {
 
     /// Sends one request and returns the whole response, or `None` when the connection fails.
     async fn response(address: SocketAddr, path: &str) -> Option<String> {
+        send(address, "GET", path).await
+    }
+
+    /// Sends one bodiless request with `method` and returns the whole response, or `None` when
+    /// the connection fails.
+    async fn send(address: SocketAddr, method: &str, path: &str) -> Option<String> {
         let mut stream = TcpStream::connect(address).await.ok()?;
         stream
             .write_all(
-                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .ok()?;
@@ -298,5 +316,65 @@ mod tests {
             "{head}"
         );
         assert_eq!(body, r#"{"category":"dependency-failure"}"#);
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_cancel_of_an_audit_export_is_uncacheable() {
+        let gate = Gate::default();
+        let running = start(gate.clone(), Duration::from_millis(100)).await;
+        let held = tokio::spawn(send(
+            running.address,
+            "POST",
+            crate::http::AUDIT_EXPORT_ROUTE,
+        ));
+        gate.entered.notified().await;
+        running.stop.send(()).expect("stop");
+        assert!(matches!(
+            running.served.await,
+            Ok(Err(ServeError::Deadline))
+        ));
+        assert!(gate.cancelled.load(Ordering::SeqCst));
+        let answered = tokio::time::timeout(Duration::from_secs(5), held)
+            .await
+            .expect("the cancelled connection closes")
+            .expect("request task")
+            .expect("the cancelled request is answered");
+        let (head, body) = answered.split_once("\r\n\r\n").expect("response head");
+        assert_eq!(
+            head.lines().next(),
+            Some("HTTP/1.1 503 Service Unavailable"),
+            "{head}"
+        );
+        assert!(
+            head.lines()
+                .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")),
+            "{head}"
+        );
+        assert_eq!(body, r#"{"category":"dependency-failure"}"#);
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_cancel_off_the_proof_routes_keeps_its_caching() {
+        let gate = Gate::default();
+        let running = start(gate.clone(), Duration::from_millis(100)).await;
+        let held = tokio::spawn(response(running.address, "/held"));
+        gate.entered.notified().await;
+        running.stop.send(()).expect("stop");
+        assert!(matches!(
+            running.served.await,
+            Ok(Err(ServeError::Deadline))
+        ));
+        let answered = tokio::time::timeout(Duration::from_secs(5), held)
+            .await
+            .expect("the cancelled connection closes")
+            .expect("request task")
+            .expect("the cancelled request is answered");
+        let (head, _) = answered.split_once("\r\n\r\n").expect("response head");
+        assert!(
+            !head
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("cache-control:")),
+            "{head}"
+        );
     }
 }

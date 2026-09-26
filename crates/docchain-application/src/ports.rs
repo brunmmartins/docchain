@@ -3,11 +3,11 @@
 //! Async operations return `Send` futures and use static dispatch. Synchronous ports are
 //! CPU-bound. Each port has its own error type, and none carries a dependency's error.
 
-use std::future::Future;
+use std::{fmt, future::Future};
 
 use docchain_domain::{
-    AuditEvent, DocumentId, DocumentVersion, EventDraft, ExchangeId, IdempotencyKey, ObjectId,
-    RequestNonce, Timestamp, WalletId,
+    AuditEvent, AuditSnapshot, DocumentId, DocumentVersion, EventDraft, ExchangeId, IdempotencyKey,
+    ObjectId, RequestNonce, Timestamp, WalletId,
 };
 use thiserror::Error;
 
@@ -302,11 +302,74 @@ pub enum IntegrityError {
 
 /// Signs and verifies event hashes with the audit key, which is separate from wallet keys.
 pub trait EventIntegrity: Send + Sync {
+    /// Returns the 32-byte Ed25519 public key corresponding to the loaded signing key.
+    fn public_key(&self) -> Result<[u8; 32], IntegrityError>;
+
     /// Signs the bytes [`docchain_domain::event_signature_input`] returns.
     fn sign(&self, input: &[u8]) -> Result<[u8; 64], IntegrityError>;
 
     /// Verifies a signature over those bytes.
     fn verify(&self, input: &[u8], signature: &[u8; 64]) -> Result<(), IntegrityError>;
+}
+
+/// One bounded, snapshot-constrained read from the audit event chain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AuditReadRequest {
+    /// `None` selects the current snapshot; `Some` continues exactly that snapshot.
+    pub snapshot: Option<AuditSnapshot>,
+    /// Last event already returned, or zero for the first page.
+    pub after_sequence: u64,
+    /// Number of events requested, from 1 through 500.
+    pub limit: u32,
+}
+
+impl fmt::Debug for AuditReadRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditReadRequest(redacted)")
+    }
+}
+
+/// A page returned by the audit store under one finite read-only snapshot transaction.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuditStoredPage {
+    /// The selected or revalidated logical snapshot.
+    pub snapshot: AuditSnapshot,
+    /// Ordered events after the cursor, never more than the request limit.
+    pub events: Vec<AuditEvent>,
+    /// Whether at least one more event exists within the snapshot.
+    pub has_more: bool,
+}
+
+impl fmt::Debug for AuditStoredPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditStoredPage(redacted)")
+    }
+}
+
+/// Failures at the narrow audit-read boundary.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum AuditReadError {
+    /// The supplied snapshot or cursor no longer matches stored evidence.
+    #[error("snapshot changed")]
+    SnapshotChanged,
+    /// The dependency is temporarily unavailable.
+    #[error("transient")]
+    Transient,
+    /// The dependency failed permanently.
+    #[error("permanent")]
+    Permanent,
+    /// Stored data broke an invariant.
+    #[error("invariant")]
+    Invariant,
+}
+
+/// Reads signed events without exposing SQL or holding state across requests.
+pub trait AuditEventStore: Send + Sync {
+    /// Selects or revalidates a snapshot and returns one ordered bounded page.
+    fn page(
+        &self,
+        request: AuditReadRequest,
+    ) -> impl Future<Output = Result<AuditStoredPage, AuditReadError>> + Send;
 }
 
 /// Store failures, shared by the document and exchange stores.
@@ -463,12 +526,6 @@ pub trait ExchangeStore: Send + Sync {
         limit: u32,
     ) -> impl Future<Output = Result<Vec<ExchangeId>, StoreError>> + Send;
 
-    /// Events in sequence order.
-    fn events(
-        &self,
-        limit: u32,
-    ) -> impl Future<Output = Result<Vec<AuditEvent>, StoreError>> + Send;
-
     /// Whether any exchange references an object.
     fn object_referenced(
         &self,
@@ -501,6 +558,8 @@ pub trait Adapters: Send + Sync {
     type Documents: DocumentStore;
     /// Exchange store port.
     type Exchanges: ExchangeStore;
+    /// Audit-event read port.
+    type AuditEvents: AuditEventStore;
     /// Clock port.
     type Clock: Clock;
 
@@ -518,6 +577,8 @@ pub trait Adapters: Send + Sync {
     fn documents(&self) -> &Self::Documents;
     /// The exchange store adapter.
     fn exchanges(&self) -> &Self::Exchanges;
+    /// The audit-event store adapter.
+    fn audit_events(&self) -> &Self::AuditEvents;
     /// The clock adapter.
     fn clock(&self) -> &Self::Clock;
 }

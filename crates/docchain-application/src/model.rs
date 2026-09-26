@@ -1,8 +1,8 @@
 use std::fmt;
 
 use docchain_domain::{
-    Checkpoint, DocumentId, DocumentVersion, DomainError, ExchangeId, IdempotencyKey, ObjectId,
-    RequestNonce, WalletId,
+    AuditChallenge, AuditEvent, AuditExportManifest, Checkpoint, DocumentId, DocumentVersion,
+    DomainError, ExchangeId, IdempotencyKey, ObjectId, RequestNonce, WalletId, sha256,
 };
 use thiserror::Error;
 
@@ -140,6 +140,281 @@ pub struct AuditReport {
     pub event_count: usize,
     /// The verified head, which the auditor keeps to detect later truncation.
     pub head: Option<Checkpoint>,
+}
+
+/// A separately provisioned SHA-256 fingerprint of the expected audit public key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AuditKeyPin([u8; 32]);
+
+impl fmt::Debug for AuditKeyPin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditKeyPin(redacted)")
+    }
+}
+
+impl AuditKeyPin {
+    /// Constructs a pin from exactly one digest.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the digest bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// The public half of the audit key together with its independently configured pin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AuditPublicKey {
+    public_key: [u8; 32],
+    fingerprint: AuditKeyPin,
+}
+
+impl fmt::Debug for AuditPublicKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditPublicKey(redacted)")
+    }
+}
+
+impl AuditPublicKey {
+    /// Checks that the configured pin is SHA-256 of `public_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplicationError::Invariant`] for a mismatched pin.
+    pub fn new(public_key: [u8; 32], fingerprint: AuditKeyPin) -> Result<Self, ApplicationError> {
+        if sha256(&public_key) != fingerprint.as_bytes() {
+            return Err(ApplicationError::Invariant);
+        }
+        Ok(Self {
+            public_key,
+            fingerprint,
+        })
+    }
+
+    /// The Ed25519 public key bytes.
+    #[must_use]
+    pub const fn public_key(self) -> [u8; 32] {
+        self.public_key
+    }
+
+    /// The verified public-key fingerprint.
+    #[must_use]
+    pub const fn fingerprint(self) -> AuditKeyPin {
+        self.fingerprint
+    }
+}
+
+/// Validated audit proof and export bounds injected at composition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AuditSettings {
+    public_key: AuditPublicKey,
+    max_export_events: u32,
+    default_page_size: u32,
+}
+
+impl fmt::Debug for AuditSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditSettings(redacted)")
+    }
+}
+
+impl AuditSettings {
+    /// Validates the fixed public bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplicationError::InvalidRequest`] unless the total is 1..=100,000 and the
+    /// default page size is 1..=500.
+    pub fn new(
+        public_key: AuditPublicKey,
+        max_export_events: u32,
+        default_page_size: u32,
+    ) -> Result<Self, ApplicationError> {
+        if !(1..=100_000).contains(&max_export_events) || !(1..=500).contains(&default_page_size) {
+            return Err(ApplicationError::InvalidRequest);
+        }
+        Ok(Self {
+            public_key,
+            max_export_events,
+            default_page_size,
+        })
+    }
+
+    /// The pinned public proof.
+    #[must_use]
+    pub const fn public_key(self) -> AuditPublicKey {
+        self.public_key
+    }
+
+    /// Maximum complete snapshot size.
+    #[must_use]
+    pub const fn max_export_events(self) -> u32 {
+        self.max_export_events
+    }
+
+    /// Page size used when a request omits it.
+    #[must_use]
+    pub const fn default_page_size(self) -> u32 {
+        self.default_page_size
+    }
+}
+
+/// A validated request for the first or a later page of one audit export.
+///
+/// Fields are private, so every request passes [`AuditExportRequest::start`] or
+/// [`AuditExportRequest::continuation`] and carries a bounded page size and cursor.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuditExportRequest {
+    pub(crate) kind: AuditExportKind,
+    limit: Option<u32>,
+}
+
+/// Which page of an export a validated request asks for.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum AuditExportKind {
+    /// Select a new snapshot for the verifier's challenge.
+    Start { challenge: AuditChallenge },
+    /// Continue the snapshot named by a signed manifest, after a sequence already received
+    /// that lies inside that snapshot.
+    Continue {
+        manifest: Box<AuditExportManifest>,
+        manifest_signature: [u8; 64],
+        after_sequence: u64,
+    },
+}
+
+impl fmt::Debug for AuditExportRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditExportRequest(redacted)")
+    }
+}
+
+impl AuditExportRequest {
+    /// Constructs a bounded start request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplicationError::InvalidRequest`] for a page size outside 1..=500.
+    pub fn start(challenge: AuditChallenge, limit: Option<u32>) -> Result<Self, ApplicationError> {
+        validate_page_size(limit)?;
+        Ok(Self {
+            kind: AuditExportKind::Start { challenge },
+            limit,
+        })
+    }
+
+    /// Constructs a bounded continuation request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplicationError::InvalidRequest`] for a page size outside 1..=500, or a
+    /// cursor that is zero or not before the manifest's last sequence.
+    pub fn continuation(
+        manifest: AuditExportManifest,
+        manifest_signature: [u8; 64],
+        after_sequence: u64,
+        limit: Option<u32>,
+    ) -> Result<Self, ApplicationError> {
+        validate_page_size(limit)?;
+        if after_sequence == 0 || after_sequence >= manifest.snapshot().event_count() {
+            return Err(ApplicationError::InvalidRequest);
+        }
+        Ok(Self {
+            kind: AuditExportKind::Continue {
+                manifest: Box::new(manifest),
+                manifest_signature,
+                after_sequence,
+            },
+            limit,
+        })
+    }
+
+    pub(crate) fn page_size(&self, default: u32) -> u32 {
+        self.limit.unwrap_or(default)
+    }
+}
+
+fn validate_page_size(limit: Option<u32>) -> Result<(), ApplicationError> {
+    if limit.is_some_and(|limit| !(1..=500).contains(&limit)) {
+        return Err(ApplicationError::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// One exact signed event proof returned in an export page.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuditExportEvent {
+    /// Preimage format version.
+    pub preimage_version: u8,
+    /// Exact bytes whose SHA-256 digest is `event_hash`.
+    pub preimage: Vec<u8>,
+    /// Chain sequence.
+    pub sequence: u64,
+    /// Previous event hash.
+    pub previous_event_hash: [u8; 32],
+    /// Hash of `preimage`.
+    pub event_hash: [u8; 32],
+    /// Audit-key signature over the event signature input.
+    pub signature: [u8; 64],
+}
+
+impl fmt::Debug for AuditExportEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditExportEvent(redacted)")
+    }
+}
+
+impl AuditExportEvent {
+    pub(crate) fn from_stored(event: AuditEvent) -> Result<Self, ApplicationError> {
+        let preimage = event
+            .preimage_v1()
+            .map_err(|_| ApplicationError::IntegrityFailure)?;
+        if sha256(&preimage) != event.event_hash {
+            return Err(ApplicationError::IntegrityFailure);
+        }
+        Ok(Self {
+            preimage_version: docchain_domain::AUDIT_PREIMAGE_VERSION,
+            preimage,
+            sequence: event.sequence,
+            previous_event_hash: event.previous_hash,
+            event_hash: event.event_hash,
+            signature: event.signature,
+        })
+    }
+}
+
+/// Whether a page is only a prefix or completes its signed snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coverage {
+    /// More pages are required.
+    Partial,
+    /// This page completes the manifest snapshot.
+    Complete,
+}
+
+/// One bounded page of challenge-bound independent audit evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuditExportPage {
+    /// Identical signed manifest repeated on every page.
+    pub manifest: AuditExportManifest,
+    /// Audit-key signature over the manifest.
+    pub manifest_signature: [u8; 64],
+    /// Whether all manifest events have now been returned.
+    pub coverage: Coverage,
+    /// Ordered exact event proofs.
+    pub events: Vec<AuditExportEvent>,
+    /// Last returned sequence for a continuation, or `None` when complete.
+    pub next_after_sequence: Option<u64>,
+}
+
+impl fmt::Debug for AuditExportPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditExportPage(redacted)")
+    }
 }
 
 /// Bounds the use cases enforce.

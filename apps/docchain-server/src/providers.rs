@@ -432,6 +432,10 @@ impl AuditKey {
 }
 
 impl EventIntegrity for AuditKey {
+    fn public_key(&self) -> Result<[u8; 32], IntegrityError> {
+        Ok(VerificationKey::from(&self.0).into())
+    }
+
     fn sign(&self, input: &[u8]) -> Result<[u8; 64], IntegrityError> {
         Ok(self.0.sign(input).into())
     }
@@ -556,6 +560,7 @@ mod tests {
             wallet_signing_private: Vec::new(),
             wallet_encryption_private: Vec::new(),
             audit_private: directory.join("unused"),
+            audit_public_key_fingerprint: [0; 32],
         }
     }
 

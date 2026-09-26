@@ -67,3 +67,8 @@ required-features = ["test-support"]
 name = "shutdown"
 path = "../../tests/system/shutdown.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "independent_audit"
+path = "../../tests/system/independent_audit.rs"
+required-features = ["test-support"]
