@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     future::Future,
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
@@ -10,15 +11,17 @@ use std::{
 };
 
 use docchain_application::{
-    AcceptanceOutcome, AuditEventStore, AuditReadError, AuditReadRequest, AuditStoredPage,
-    CreditPosting, DocumentStore, EventIntegrity, ExchangeRecord, ExchangeStore, StoreError,
+    AcceptanceOutcome, AuditCreditSnapshot, AuditEventStore, AuditReadError, AuditReadRequest,
+    AuditStoredPage, CreditPosting, DocumentStore, EventIntegrity, ExchangeRecord, ExchangeStore,
+    StoreError,
 };
 use docchain_domain::{
-    AuditEvent, AuditSnapshot, Checkpoint, DocumentId, DocumentVersion, EventDraft, EventKind,
-    ExchangeId, IdempotencyKey, ObjectId, RequestNonce, Timestamp, WalletId, event_signature_input,
+    AuditEvent, AuditSnapshot, Checkpoint, CreditLedgerEntry, CreditLedgerTransaction, DocumentId,
+    DocumentVersion, EventDraft, EventKind, ExchangeId, ISSUANCE_ACCOUNT, IdempotencyKey, ObjectId,
+    RequestNonce, Timestamp, WalletId, event_signature_input,
 };
 use sqlx::{
-    PgPool, Postgres, Row as _, SqlStr, Transaction,
+    PgConnection, PgPool, Postgres, Row as _, SqlStr, Transaction,
     error::BoxDynError,
     migrate::{Migration, MigrationSource, MigrationType, Migrator},
 };
@@ -28,7 +31,7 @@ use tokio::{fs, io::AsyncWriteExt as _, sync::Mutex, task::JoinHandle};
 ///
 /// Every file in `migrations/` must appear here, in version order; a unit test compares this list
 /// with the directory.
-const MIGRATIONS: [(i64, &str, &str); 5] = [
+const MIGRATIONS: [(i64, &str, &str); 6] = [
     (
         1,
         "first exchange",
@@ -53,6 +56,11 @@ const MIGRATIONS: [(i64, &str, &str); 5] = [
         5,
         "record send commit time",
         include_str!("../migrations/0005_record_send_commit_time.sql"),
+    ),
+    (
+        6,
+        "least privilege runtime grants",
+        include_str!("../migrations/0006_least_privilege_runtime_grants.sql"),
     ),
 ];
 
@@ -80,20 +88,459 @@ impl MigrationSource<'static> for EmbeddedMigrations {
     }
 }
 
-/// Applies every pending migration in order, each in its own transaction.
+/// Applies every pending migration in order, each in its own transaction, on one connection.
 ///
 /// Each applied version is recorded with its checksum; a changed applied migration is refused.
+/// Only the migration owner runs this, on a connection that sets `docchain.runtime_role`; the
+/// server never does.
 ///
 /// # Errors
 ///
-/// [`StoreError::Permanent`] when a migration fails or an applied one was changed.
-pub(crate) async fn migrate(pool: &PgPool) -> Result<(), StoreError> {
+/// [`StoreError::Permanent`] when a migration fails or an applied one was changed. SQLx keeps
+/// its database-wide migration lock on the connection of a failed run until it closes.
+pub(crate) async fn migrate_schema(conn: &mut PgConnection) -> Result<(), StoreError> {
+    // `run_direct` is what `Migrator::run` calls once it holds a connection. Calling it with the
+    // connection itself keeps callers' futures `Send` for every lifetime, which `run` cannot:
+    // SQLx implements `Acquire` for a connection reference at one specific lifetime only.
     Migrator::new(EmbeddedMigrations)
         .await
         .map_err(|_| StoreError::Permanent)?
-        .run(pool)
+        .run_direct(None, conn, false)
         .await
         .map_err(|_| StoreError::Permanent)
+}
+
+/// Whether `role` is a superuser. A role that `pg_roles` does not list counts as one, so a
+/// missing or unreadable role never passes as safe.
+///
+/// # Errors
+///
+/// [`StoreError`] when the catalog cannot be read.
+pub(crate) async fn role_is_superuser(
+    conn: &mut PgConnection,
+    role: &str,
+) -> Result<bool, StoreError> {
+    sqlx::query_scalar("SELECT COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = $1), TRUE)")
+        .bind(role)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sql)
+}
+
+/// The session and current roles of a connection, which differ after `SET ROLE`.
+///
+/// # Errors
+///
+/// [`StoreError`] when the connection fails.
+pub(crate) async fn session_roles(conn: &mut PgConnection) -> Result<(String, String), StoreError> {
+    sqlx::query_as("SELECT session_user::text, current_user::text")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sql)
+}
+
+/// Whether either role of this connection is a superuser, or cannot be checked.
+pub(crate) async fn session_is_superuser(conn: &mut PgConnection) -> bool {
+    let Ok((session, current)) = session_roles(conn).await else {
+        return true;
+    };
+    for role in [session, current] {
+        if !matches!(role_is_superuser(conn, &role).await, Ok(false)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the configured schema exists. It reads `pg_namespace`, because `current_schema()` is
+/// NULL for a role without USAGE on the schema.
+///
+/// # Errors
+///
+/// [`StoreError`] when the catalog cannot be read.
+pub(crate) async fn schema_exists(
+    conn: &mut PgConnection,
+    schema: &str,
+) -> Result<bool, StoreError> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+        .bind(schema)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sql)
+}
+
+/// How the migration ledger in a schema compares with the embedded migrations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MigrationState {
+    /// Every embedded version is applied, successfully and unchanged, and nothing else is.
+    Current,
+    /// The connected role cannot use the schema or read the ledger, or an embedded version is
+    /// not recorded.
+    Pending,
+    /// An applied version failed, has a different checksum, or is unknown to this binary.
+    Mismatch,
+}
+
+/// Compares the ledger with the embedded migrations. It reads catalogs and the ledger only; it
+/// writes nothing and takes no lock.
+///
+/// # Errors
+///
+/// [`StoreError`] when a read fails for a reason other than a missing privilege.
+pub(crate) async fn migration_state(
+    conn: &mut PgConnection,
+    schema: &str,
+) -> Result<MigrationState, StoreError> {
+    let readable: bool = sqlx::query_scalar(
+        "SELECT COALESCE(( \
+             SELECT has_schema_privilege(current_user, oid, 'USAGE') \
+                 AND to_regclass(format('%I._sqlx_migrations', nspname)) IS NOT NULL \
+                 AND has_table_privilege( \
+                     to_regclass(format('%I._sqlx_migrations', nspname)), 'SELECT') \
+             FROM pg_namespace WHERE nspname = $1), FALSE)",
+    )
+    .bind(schema.to_owned())
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sql)?;
+    if !readable {
+        return Ok(MigrationState::Pending);
+    }
+    // The schema is a validated lower-case identifier; it is quoted as one all the same.
+    let applied: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT version, success, checksum FROM \"{schema}\"._sqlx_migrations ORDER BY version"
+    )))
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(map_sql)?;
+    let embedded = Migrator::new(EmbeddedMigrations)
+        .await
+        .map_err(|_| StoreError::Invariant)?;
+    if embedded.iter().any(|migration| {
+        !applied
+            .iter()
+            .any(|(version, _, _)| *version == migration.version)
+    }) {
+        return Ok(MigrationState::Pending);
+    }
+    let unchanged = applied.iter().all(|(version, success, checksum)| {
+        *success
+            && embedded.iter().any(|migration| {
+                migration.version == *version && migration.checksum.as_ref() == checksum.as_slice()
+            })
+    });
+    Ok(if unchanged {
+        MigrationState::Current
+    } else {
+        MigrationState::Mismatch
+    })
+}
+
+/// Which relation columns one column grant covers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ColumnRule {
+    /// Every live column except the one named.
+    Except(&'static str),
+    /// Only the column named.
+    Only(&'static str),
+}
+
+/// One relation's runtime privileges: table-level privileges, which PostgreSQL also reports on
+/// every column, and column-level grants.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RelationPrivileges {
+    pub(crate) relation: &'static str,
+    pub(crate) table: &'static [&'static str],
+    pub(crate) columns: &'static [(&'static str, ColumnRule)],
+}
+
+/// The runtime role's complete privilege matrix in the configured schema.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuntimePrivileges {
+    pub(crate) schema: &'static [&'static str],
+    pub(crate) relations: &'static [RelationPrivileges],
+}
+
+/// The only code copy of the runtime privilege matrix. Migration 0006 grants exactly this and
+/// carries the same list for its postcondition; a unit test compares the two. No sequence or
+/// function privilege is listed, so the runtime role must hold none, and an object not listed
+/// must show no privilege. A migration that adds or changes an object updates both.
+pub(crate) const RUNTIME_PRIVILEGES: RuntimePrivileges = RuntimePrivileges {
+    schema: &["USAGE"],
+    relations: &[
+        RelationPrivileges {
+            relation: "exchanges",
+            table: &["SELECT"],
+            columns: &[
+                ("INSERT", ColumnRule::Except("accepted")),
+                ("UPDATE", ColumnRule::Only("accepted")),
+            ],
+        },
+        RelationPrivileges {
+            relation: "audit_events",
+            table: &["SELECT", "INSERT"],
+            columns: &[],
+        },
+        RelationPrivileges {
+            relation: "acceptances",
+            table: &["INSERT"],
+            columns: &[],
+        },
+        RelationPrivileges {
+            relation: "credit_transactions",
+            table: &["SELECT", "INSERT"],
+            columns: &[],
+        },
+        RelationPrivileges {
+            relation: "credit_entries",
+            table: &["SELECT", "INSERT"],
+            columns: &[],
+        },
+        RelationPrivileges {
+            relation: "_sqlx_migrations",
+            table: &["SELECT"],
+            columns: &[],
+        },
+    ],
+};
+
+/// One class of the runtime privilege rule that a role breaks. Only tests inspect it; startup
+/// output never names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum PrivilegeViolation {
+    /// The role is a superuser, holds CREATEROLE, CREATEDB, REPLICATION, or BYPASSRLS, or does
+    /// not exist.
+    Attribute,
+    /// The role is a member of some role.
+    Membership,
+    /// The role owns the current database.
+    DatabaseOwner,
+    /// The role owns some object anywhere in the cluster.
+    ObjectOwner,
+    /// The role or PUBLIC holds a parameter privilege.
+    ParameterPrivilege,
+    /// The role can create schemas in the current database.
+    DatabaseCreate,
+    /// The role has a per-role setting.
+    RoleSetting,
+    /// The schema privileges differ from the matrix, or the schema is missing.
+    SchemaPrivilege,
+    /// A relation's privileges differ from the matrix, or a listed relation is missing.
+    TablePrivilege,
+    /// A column's privileges differ from the matrix.
+    ColumnPrivilege,
+    /// The role holds a sequence privilege.
+    SequencePrivilege,
+    /// The role holds a function privilege.
+    FunctionPrivilege,
+    /// The role holds some privilege with grant option.
+    GrantOption,
+}
+
+/// Every class of the runtime privilege rule that `role` breaks: part A, the principal, and
+/// part B, effective privileges in the connection's current schema equal to
+/// [`RUNTIME_PRIVILEGES`] with no grant option. An empty set means the role is acceptable.
+///
+/// It takes a connection, so tests can check state that a transaction on that connection has
+/// not committed. It reads catalogs only and takes no lock.
+///
+/// # Errors
+///
+/// [`StoreError`] when a catalog cannot be read.
+pub(crate) async fn runtime_privilege_violations(
+    conn: &mut PgConnection,
+    role: &str,
+) -> Result<BTreeSet<PrivilegeViolation>, StoreError> {
+    let mut violations = BTreeSet::new();
+    let role_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(role)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_sql)?;
+    if !role_exists {
+        violations.insert(PrivilegeViolation::Attribute);
+        return Ok(violations);
+    }
+    let principal: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT \
+             COALESCE(role.rolsuper OR role.rolcreaterole OR role.rolcreatedb \
+                 OR role.rolreplication OR role.rolbypassrls, TRUE), \
+             EXISTS(SELECT 1 FROM pg_auth_members WHERE member = role.oid), \
+             EXISTS(SELECT 1 FROM pg_database \
+                 WHERE datname = current_database() AND datdba = role.oid), \
+             EXISTS(SELECT 1 FROM pg_shdepend WHERE refclassid = 'pg_authid'::regclass \
+                 AND refobjid = role.oid AND deptype = 'o'), \
+             EXISTS(SELECT 1 FROM pg_parameter_acl, aclexplode(paracl) AS entry \
+                 WHERE entry.grantee = 0 OR entry.grantee = role.oid), \
+             COALESCE(has_database_privilege(role.oid, current_database(), 'CREATE'), TRUE), \
+             EXISTS(SELECT 1 FROM pg_db_role_setting WHERE setrole = role.oid) \
+         FROM (SELECT $1::text AS name) AS wanted \
+         LEFT JOIN pg_roles AS role ON role.rolname = wanted.name",
+    )
+    .bind(role)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_sql)?;
+    for (broken, violation) in [
+        (principal.0, PrivilegeViolation::Attribute),
+        (principal.1, PrivilegeViolation::Membership),
+        (principal.2, PrivilegeViolation::DatabaseOwner),
+        (principal.3, PrivilegeViolation::ObjectOwner),
+        (principal.4, PrivilegeViolation::ParameterPrivilege),
+        (principal.5, PrivilegeViolation::DatabaseCreate),
+        (principal.6, PrivilegeViolation::RoleSetting),
+    ] {
+        if broken {
+            violations.insert(violation);
+        }
+    }
+    let schema: Option<String> = sqlx::query_scalar("SELECT current_schema()::text")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sql)?;
+    let Some(schema) = schema else {
+        violations.insert(PrivilegeViolation::SchemaPrivilege);
+        return Ok(violations);
+    };
+
+    let held: Vec<(String, String, String, String, bool)> = sqlx::query_as(HELD_PRIVILEGES)
+        .bind(role)
+        .bind(&schema)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(map_sql)?;
+    let live_columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT relation.relname::text, attribute.attname::text \
+         FROM pg_class AS relation \
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+         JOIN pg_attribute AS attribute ON attribute.attrelid = relation.oid \
+             AND attribute.attnum > 0 AND NOT attribute.attisdropped \
+         WHERE namespace.nspname = $1 AND relation.relkind IN ('r', 'v', 'm', 'f', 'p')",
+    )
+    .bind(&schema)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(map_sql)?;
+
+    let expected = expected_privileges(&RUNTIME_PRIVILEGES, &live_columns);
+    let mut actual = BTreeSet::new();
+    for (kind, object, column, privilege, grantable) in held {
+        if grantable {
+            violations.insert(PrivilegeViolation::GrantOption);
+        }
+        actual.insert((kind, object, column, privilege));
+    }
+    for (kind, ..) in actual.symmetric_difference(&expected) {
+        violations.insert(match kind.as_str() {
+            "schema" => PrivilegeViolation::SchemaPrivilege,
+            "table" => PrivilegeViolation::TablePrivilege,
+            "column" => PrivilegeViolation::ColumnPrivilege,
+            "sequence" => PrivilegeViolation::SequencePrivilege,
+            _ => PrivilegeViolation::FunctionPrivilege,
+        });
+    }
+    Ok(violations)
+}
+
+/// One effective privilege: kind, object, column, and privilege, with empty text where a part
+/// does not apply.
+type HeldPrivilege = (String, String, String, String);
+
+/// Every effective privilege `$1` holds on schema `$2` and its objects, with whether it is held
+/// with grant option.
+const HELD_PRIVILEGES: &str = "\
+    WITH role AS (SELECT oid FROM pg_roles WHERE rolname = $1), \
+    namespace AS (SELECT oid FROM pg_namespace WHERE nspname = $2), \
+    relations AS ( \
+        SELECT relation.oid, relation.relname::text AS name, relation.relkind \
+        FROM pg_class AS relation, namespace \
+        WHERE relation.relnamespace = namespace.oid \
+            AND relation.relkind IN ('r', 'v', 'm', 'f', 'p', 'S')), \
+    live_columns AS ( \
+        SELECT relations.oid, relations.name, attribute.attnum, \
+            attribute.attname::text AS column_name \
+        FROM relations JOIN pg_attribute AS attribute ON attribute.attrelid = relations.oid \
+            AND attribute.attnum > 0 AND NOT attribute.attisdropped \
+        WHERE relations.relkind <> 'S') \
+    SELECT 'schema', '', '', held, \
+        has_schema_privilege(role.oid, namespace.oid, held || ' WITH GRANT OPTION') \
+    FROM role, namespace, unnest(ARRAY['USAGE', 'CREATE']) AS held \
+    WHERE has_schema_privilege(role.oid, namespace.oid, held) \
+    UNION ALL \
+    SELECT 'table', relations.name, '', held, \
+        has_table_privilege(role.oid, relations.oid, held || ' WITH GRANT OPTION') \
+    FROM role, relations, unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', \
+        'REFERENCES', 'TRIGGER', 'MAINTAIN']) AS held \
+    WHERE relations.relkind <> 'S' AND has_table_privilege(role.oid, relations.oid, held) \
+    UNION ALL \
+    SELECT 'column', live_columns.name, live_columns.column_name, held, \
+        has_column_privilege(role.oid, live_columns.oid, live_columns.attnum, \
+            held || ' WITH GRANT OPTION') \
+    FROM role, live_columns, unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']) AS held \
+    WHERE has_column_privilege(role.oid, live_columns.oid, live_columns.attnum, held) \
+    UNION ALL \
+    SELECT 'sequence', relations.name, '', held, \
+        has_sequence_privilege(role.oid, relations.oid, held || ' WITH GRANT OPTION') \
+    FROM role, relations, unnest(ARRAY['USAGE', 'SELECT', 'UPDATE']) AS held \
+    WHERE relations.relkind = 'S' AND has_sequence_privilege(role.oid, relations.oid, held) \
+    UNION ALL \
+    SELECT 'function', function_row.oid::text, '', 'EXECUTE', \
+        has_function_privilege(role.oid, function_row.oid, 'EXECUTE WITH GRANT OPTION') \
+    FROM role, namespace, pg_proc AS function_row \
+    WHERE function_row.pronamespace = namespace.oid \
+        AND has_function_privilege(role.oid, function_row.oid, 'EXECUTE')";
+
+/// The effective privileges the matrix implies, given the live columns of each relation.
+fn expected_privileges(
+    matrix: &RuntimePrivileges,
+    live_columns: &[(String, String)],
+) -> BTreeSet<HeldPrivilege> {
+    let mut expected = BTreeSet::new();
+    for privilege in matrix.schema {
+        expected.insert((
+            "schema".to_owned(),
+            String::new(),
+            String::new(),
+            (*privilege).to_owned(),
+        ));
+    }
+    for relation in matrix.relations {
+        for privilege in relation.table {
+            expected.insert((
+                "table".to_owned(),
+                relation.relation.to_owned(),
+                String::new(),
+                (*privilege).to_owned(),
+            ));
+        }
+        let columns = live_columns
+            .iter()
+            .filter(|(name, _)| name == relation.relation)
+            .map(|(_, column)| column.as_str());
+        for column in columns {
+            let table_level = relation.table.iter().copied().filter(|privilege| {
+                ["SELECT", "INSERT", "UPDATE", "REFERENCES"].contains(privilege)
+            });
+            let column_level = relation
+                .columns
+                .iter()
+                .filter(|(_, rule)| match rule {
+                    ColumnRule::Except(excluded) => column != *excluded,
+                    ColumnRule::Only(included) => column == *included,
+                })
+                .map(|(privilege, _)| *privilege);
+            for privilege in table_level.chain(column_level) {
+                expected.insert((
+                    "column".to_owned(),
+                    relation.relation.to_owned(),
+                    column.to_owned(),
+                    privilege.to_owned(),
+                ));
+            }
+        }
+    }
+    expected
 }
 
 /// How long a writability probe's result answers later callers.
@@ -334,7 +781,7 @@ impl PgExchangeStore {
         Self { pool }
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) const fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -504,10 +951,11 @@ impl ExchangeStore for PgExchangeStore {
         .map_err(map_sql)?;
         sqlx::query(
             "INSERT INTO credit_entries (eligibility_key, account_id, amount) \
-             VALUES ($1, 'issuance', -1), ($1, $2, 1)",
+             VALUES ($1, $3, -1), ($1, $2, 1)",
         )
         .bind(&credit.eligibility_key)
         .bind(credit.wallet.as_str())
+        .bind(ISSUANCE_ACCOUNT)
         .execute(&mut *transaction)
         .await
         .map_err(map_sql)?;
@@ -597,31 +1045,7 @@ impl AuditEventStore for PgExchangeStore {
                 }
                 snapshot
             }
-            None => {
-                let tail = sqlx::query(
-                    "SELECT sequence, event_hash, signature FROM audit_events \
-                     ORDER BY sequence DESC LIMIT 1",
-                )
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(map_audit_sql)?;
-                match tail {
-                    None => AuditSnapshot::new(0, None).map_err(|_| AuditReadError::Invariant)?,
-                    Some(row) => {
-                        let sequence = from_i64(row.try_get("sequence").map_err(map_audit_sql)?)
-                            .map_err(|_| AuditReadError::Invariant)?;
-                        let head = Checkpoint {
-                            sequence,
-                            event_hash: exact(row.try_get("event_hash").map_err(map_audit_sql)?)
-                                .map_err(|_| AuditReadError::Invariant)?,
-                            signature: exact(row.try_get("signature").map_err(map_audit_sql)?)
-                                .map_err(|_| AuditReadError::Invariant)?,
-                        };
-                        AuditSnapshot::new(sequence, Some(head))
-                            .map_err(|_| AuditReadError::Invariant)?
-                    }
-                }
-            }
+            None => select_tail(&mut transaction).await?,
         };
 
         if request.after_sequence > snapshot.event_count() {
@@ -681,6 +1105,156 @@ impl AuditEventStore for PgExchangeStore {
             has_more,
         })
     }
+
+    async fn credit_snapshot(
+        &self,
+        max_transactions: u32,
+    ) -> Result<AuditCreditSnapshot, AuditReadError> {
+        let max_transactions = i64::from(max_transactions);
+        let max_entries = max_transactions
+            .checked_mul(2)
+            .ok_or(AuditReadError::Invariant)?;
+        let mut transaction = self.pool.begin().await.map_err(map_audit_sql)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_audit_sql)?;
+        let snapshot = select_tail(&mut transaction).await?;
+        let (transactions, entries): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM credit_transactions), \
+             (SELECT COUNT(*) FROM credit_entries)",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(map_audit_sql)?;
+        if transactions > max_transactions || entries > max_entries {
+            return Err(AuditReadError::Exhausted);
+        }
+        // Every joined row is a transaction, an entry, or both; more rows than both bounds
+        // together can only come from rows sharing one key, and are refused the same way.
+        let row_limit = max_transactions
+            .checked_add(max_entries)
+            .ok_or(AuditReadError::Invariant)?;
+        let rows: Vec<LedgerRow> = sqlx::query_as(
+            "SELECT credit.ctid::text, left(credit.eligibility_key, 129), \
+             left(credit.exchange_id, 129), entry.ctid IS NOT NULL, \
+             left(entry.eligibility_key, 129), \
+             left(entry.account_id, 129), entry.amount \
+             FROM credit_transactions AS credit \
+             FULL OUTER JOIN credit_entries AS entry \
+                 ON entry.eligibility_key = credit.eligibility_key \
+             ORDER BY COALESCE(credit.eligibility_key, entry.eligibility_key), credit.ctid, \
+                 entry.account_id, entry.amount \
+             LIMIT $1",
+        )
+        .bind(row_limit.saturating_add(1))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(map_audit_sql)?;
+        if i64::try_from(rows.len()).map_or(true, |count| count > row_limit) {
+            return Err(AuditReadError::Exhausted);
+        }
+        transaction.commit().await.map_err(map_audit_sql)?;
+        Ok(AuditCreditSnapshot {
+            snapshot,
+            transactions: group_ledger(rows),
+        })
+    }
+}
+
+/// The current chain tail, inside the caller's snapshot transaction.
+async fn select_tail(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<AuditSnapshot, AuditReadError> {
+    let tail = sqlx::query(
+        "SELECT sequence, event_hash, signature FROM audit_events \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(map_audit_sql)?;
+    match tail {
+        None => AuditSnapshot::new(0, None).map_err(|_| AuditReadError::Invariant),
+        Some(row) => {
+            let sequence = from_i64(row.try_get("sequence").map_err(map_audit_sql)?)
+                .map_err(|_| AuditReadError::Invariant)?;
+            let head = Checkpoint {
+                sequence,
+                event_hash: exact(row.try_get("event_hash").map_err(map_audit_sql)?)
+                    .map_err(|_| AuditReadError::Invariant)?,
+                signature: exact(row.try_get("signature").map_err(map_audit_sql)?)
+                    .map_err(|_| AuditReadError::Invariant)?,
+            };
+            AuditSnapshot::new(sequence, Some(head)).map_err(|_| AuditReadError::Invariant)
+        }
+    }
+}
+
+/// One row of the credit ledger read: a transaction row, an entry, or both. It holds the
+/// transaction's row identity, key, and exchange; whether an entry row is present; and the
+/// entry's key, account, and amount. Text values are truncated to 129 characters, one more than
+/// any valid key or identifier can reach.
+type LedgerRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// Groups the ordered ledger rows: one transaction per stored transaction row, with its
+/// entries, and one per eligibility key for entries that have no transaction row.
+fn group_ledger(rows: Vec<LedgerRow>) -> Vec<CreditLedgerTransaction> {
+    /// A stored transaction row, or the key of entries without one.
+    #[derive(PartialEq, Eq)]
+    enum Group {
+        Transaction(String),
+        Orphaned(Option<String>),
+    }
+
+    let mut grouped: Vec<(Group, CreditLedgerTransaction)> = Vec::new();
+    for (
+        transaction_row,
+        transaction_key,
+        exchange_id,
+        entry_present,
+        entry_key,
+        account,
+        amount,
+    ) in rows
+    {
+        let (group, eligibility_key, exchange_id) = match transaction_row {
+            Some(row) => (
+                Group::Transaction(row),
+                transaction_key,
+                Some(exchange_id.unwrap_or_default()),
+            ),
+            None => (Group::Orphaned(entry_key.clone()), entry_key.clone(), None),
+        };
+        if grouped.last().is_none_or(|(last, _)| *last != group) {
+            grouped.push((
+                group,
+                CreditLedgerTransaction {
+                    eligibility_key: eligibility_key.unwrap_or_default(),
+                    exchange_id,
+                    entries: Vec::new(),
+                },
+            ));
+        }
+        // A stored NULL never matches an expected entry, so it is read as a value that cannot.
+        if let (true, Some((_, current))) = (entry_present, grouped.last_mut()) {
+            current.entries.push(CreditLedgerEntry {
+                account: account.unwrap_or_default(),
+                amount: amount.unwrap_or(0),
+            });
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(_, transaction)| transaction)
+        .collect()
 }
 
 async fn append_event<I: EventIntegrity>(
@@ -904,7 +1478,129 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5]
+            [1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn migration_0006_postcondition_lists_the_runtime_privilege_matrix() {
+        let mut rendered = Vec::new();
+        for privilege in RUNTIME_PRIVILEGES.schema {
+            rendered.push(format!("('schema', '', '', '{privilege}')"));
+        }
+        for relation in RUNTIME_PRIVILEGES.relations {
+            let name = relation.relation;
+            for privilege in relation.table {
+                rendered.push(format!("('table', '{name}', '', '{privilege}')"));
+            }
+            for (privilege, rule) in relation.columns {
+                let (kind, columns) = match rule {
+                    ColumnRule::Except(columns) => ("columns except", columns),
+                    ColumnRule::Only(columns) => ("columns only", columns),
+                };
+                rendered.push(format!("('{kind}', '{name}', '{columns}', '{privilege}')"));
+            }
+        }
+        let (version, _, sql) = MIGRATIONS[5];
+        assert_eq!(version, 6);
+        let listed = sql
+            .split("-- runtime privilege matrix")
+            .nth(1)
+            .and_then(|rest| rest.split("-- end of runtime privilege matrix").next())
+            .expect("matrix block")
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('('))
+            .map(|line| line.trim_end_matches(',').to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(listed, rendered);
+    }
+
+    #[test]
+    fn ledger_rows_group_by_stored_transaction_and_orphaned_key() {
+        let text = |value: &str| Some(value.to_owned());
+        let rows: Vec<LedgerRow> = vec![
+            // One transaction with two entries.
+            (
+                text("(0,1)"),
+                text("acceptance:a"),
+                text("exc_a"),
+                true,
+                text("acceptance:a"),
+                text("issuance"),
+                Some(-1),
+            ),
+            (
+                text("(0,1)"),
+                text("acceptance:a"),
+                text("exc_a"),
+                true,
+                text("acceptance:a"),
+                text("wal_a"),
+                Some(1),
+            ),
+            // A second row with the same key is its own transaction, with its own entry.
+            (
+                text("(0,2)"),
+                text("acceptance:a"),
+                text("exc_b"),
+                true,
+                text("acceptance:a"),
+                text("wal_a"),
+                Some(1),
+            ),
+            // A transaction with no entries.
+            (
+                text("(0,3)"),
+                text("acceptance:b"),
+                text("exc_c"),
+                false,
+                None,
+                None,
+                None,
+            ),
+            // Entries with no transaction, one holding stored NULLs.
+            (
+                None,
+                None,
+                None,
+                true,
+                text("orphan"),
+                text("wal_a"),
+                Some(1),
+            ),
+            (None, None, None, true, text("orphan"), None, None),
+            // An entry whose key is NULL.
+            (None, None, None, true, None, text("wal_a"), Some(1)),
+        ];
+        let grouped = group_ledger(rows);
+        let summary = grouped
+            .iter()
+            .map(|transaction| {
+                (
+                    transaction.eligibility_key.as_str(),
+                    transaction.exchange_id.as_deref(),
+                    transaction
+                        .entries
+                        .iter()
+                        .map(|entry| (entry.account.as_str(), entry.amount))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "acceptance:a",
+                    Some("exc_a"),
+                    vec![("issuance", -1), ("wal_a", 1)]
+                ),
+                ("acceptance:a", Some("exc_b"), vec![("wal_a", 1)]),
+                ("acceptance:b", Some("exc_c"), vec![]),
+                ("orphan", None, vec![("wal_a", 1), ("", 0)]),
+                ("", None, vec![("wal_a", 1)]),
+            ]
         );
     }
 
@@ -1044,12 +1740,32 @@ mod tests {
             .expect("recorded migrations")
         }
 
-        async fn migrated() -> (FixtureFiles, PgPool) {
+        /// Applies every pending migration on one connection of `pool`, and closes that
+        /// connection after a failure, so SQLx's database-wide migration lock is released.
+        async fn migrate(pool: &PgPool) -> Result<(), StoreError> {
+            let mut conn = pool.acquire().await.expect("connection");
+            let migrated = migrate_schema(&mut conn).await;
+            if migrated.is_err() {
+                conn.close()
+                    .await
+                    .expect("close the failed migration connection");
+            }
+            migrated
+        }
+
+        /// A new fixture whose schema the owner created, with the owner's pool.
+        async fn created() -> (FixtureFiles, PgPool) {
             let fixture = FixtureFiles::write().expect("fixture files");
-            fixture.create_schema().await.expect("schema");
-            let pool = fixture.pool().await.expect("pool");
-            migrate(&pool).await.expect("migrations");
-            (fixture, pool)
+            let owner = fixture.owner_pool().await.expect("owner pool");
+            fixture.create_schema(&owner).await.expect("schema");
+            (fixture, owner)
+        }
+
+        /// A fixture migrated by the owner, with the owner's pool.
+        async fn migrated() -> (FixtureFiles, PgPool) {
+            let (fixture, owner) = created().await;
+            migrate(&owner).await.expect("migrations");
+            (fixture, owner)
         }
 
         #[tokio::test]
@@ -1134,6 +1850,59 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn migration_state_reports_current_pending_and_mismatch() {
+            let (fixture, owner) = created().await;
+            let runtime = fixture.runtime_pool().await.expect("runtime pool");
+            let state = |pool: PgPool| {
+                let schema = fixture.schema.clone();
+                async move {
+                    let mut conn = pool.acquire().await.expect("connection");
+                    migration_state(&mut conn, &schema).await
+                }
+            };
+            // Unmigrated: the runtime role has no USAGE, and the owner has no ledger.
+            assert_eq!(state(runtime.clone()).await, Ok(MigrationState::Pending));
+            assert_eq!(state(owner.clone()).await, Ok(MigrationState::Pending));
+            migrate(&owner).await.expect("migrations");
+            assert_eq!(state(runtime.clone()).await, Ok(MigrationState::Current));
+
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 2")
+                .bind(vec![0_u8; 48])
+                .execute(&owner)
+                .await
+                .expect("tamper with the recorded checksum");
+            assert_eq!(state(runtime.clone()).await, Ok(MigrationState::Mismatch));
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 2")
+                .bind(Sha384::digest(MIGRATIONS[1].2.as_bytes()).to_vec())
+                .execute(&owner)
+                .await
+                .expect("restore the recorded checksum");
+            sqlx::query("UPDATE _sqlx_migrations SET success = FALSE WHERE version = 3")
+                .execute(&owner)
+                .await
+                .expect("mark a version failed");
+            assert_eq!(state(runtime.clone()).await, Ok(MigrationState::Mismatch));
+            sqlx::query("UPDATE _sqlx_migrations SET success = TRUE WHERE version = 3")
+                .execute(&owner)
+                .await
+                .expect("restore the version");
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+                 VALUES (99, 'unknown', TRUE, '\\x00', 0)",
+            )
+            .execute(&owner)
+            .await
+            .expect("record an unknown version");
+            assert_eq!(state(runtime.clone()).await, Ok(MigrationState::Mismatch));
+            sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (6, 99)")
+                .execute(&owner)
+                .await
+                .expect("remove the newest version");
+            assert_eq!(state(runtime).await, Ok(MigrationState::Pending));
+        }
+
+        #[tokio::test]
         async fn migration_scopes_the_document_tuple_to_the_sender() {
             let (_fixture, pool) = migrated().await;
             let unique: Vec<Vec<String>> = sqlx::query_scalar(
@@ -1214,9 +1983,7 @@ mod tests {
 
         /// A schema migrated to version 4 only, as a server before the commit-time column left it.
         async fn at_version_four() -> (FixtureFiles, PgPool) {
-            let fixture = FixtureFiles::write().expect("fixture files");
-            fixture.create_schema().await.expect("schema");
-            let pool = fixture.pool().await.expect("pool");
+            let (fixture, pool) = created().await;
             Migrator::new(EmbeddedMigrations)
                 .await
                 .expect("embedded migrations")
@@ -1289,10 +2056,10 @@ mod tests {
         async fn commit_time_round_trips_unchanged() {
             use crate::providers::AuditKey;
 
-            let (fixture, pool) = migrated().await;
+            let (fixture, _owner) = migrated().await;
             let audit_key_path = fixture.root.join("audit.key");
             let integrity = AuditKey::load(&audit_key_path).expect("audit key");
-            let store = PgExchangeStore::new(pool);
+            let store = PgExchangeStore::new(fixture.runtime_pool().await.expect("runtime pool"));
             // 1970-01-02T00:00:00Z: no clock read during this test can produce it.
             let committed_at = Timestamp::from_unix_seconds(86_400);
             let sender = WalletId::new("wal_0000000000000001").expect("wallet");
@@ -1335,7 +2102,7 @@ mod tests {
                 .await
                 .expect("send");
             let credit = CreditPosting {
-                eligibility_key: format!("acceptance:{}", record.exchange_id),
+                eligibility_key: docchain_domain::acceptance_eligibility_key(&record.exchange_id),
                 wallet: sender.clone(),
                 amount: 1,
             };
@@ -1385,7 +2152,8 @@ mod tests {
             );
         }
 
-        /// Runs one statement as the table owner with the append-only triggers disabled.
+        /// Runs one statement as the table owner, whose pool `pool` is, with the append-only
+        /// triggers disabled.
         async fn tamper(pool: &PgPool, statement: &str) {
             let mut transaction = pool.begin().await.expect("transaction");
             for action in ["DISABLE", "ENABLE ALWAYS"] {
@@ -1416,7 +2184,7 @@ mod tests {
 
             let (fixture, pool) = migrated().await;
             let integrity = AuditKey::load(&fixture.root.join("audit.key")).expect("audit key");
-            let store = PgExchangeStore::new(pool.clone());
+            let store = PgExchangeStore::new(fixture.runtime_pool().await.expect("runtime pool"));
             let send = |index: u8| {
                 let record = ExchangeRecord {
                     exchange_id: ExchangeId::new(format!(
@@ -1552,8 +2320,7 @@ mod tests {
 
         #[tokio::test]
         async fn connection_uses_only_the_configured_schema() {
-            let fixture = FixtureFiles::write().expect("fixture files");
-            fixture.create_schema().await.expect("schema");
+            let (fixture, _owner) = migrated().await;
             let service = DocchainService::compose(&fixture.settings)
                 .await
                 .expect("composed service");
@@ -1593,6 +2360,454 @@ mod tests {
             ));
             // It failed before migrations: nothing created the schema or any table.
             assert_eq!(fixture.schema_exists().await.ok(), Some(false));
+        }
+
+        /// The runtime privilege violations of `role`, checked on one connection of `pool`.
+        async fn violations(pool: &PgPool, role: &str) -> BTreeSet<PrivilegeViolation> {
+            let mut conn = pool.acquire().await.expect("connection");
+            runtime_privilege_violations(&mut conn, role)
+                .await
+                .expect("privilege check")
+        }
+
+        /// The name of the role with OID 10, the cluster's bootstrap superuser.
+        async fn bootstrap_role(pool: &PgPool) -> String {
+            sqlx::query_scalar("SELECT rolname::text FROM pg_roles WHERE oid = 10")
+                .fetch_one(pool)
+                .await
+                .expect("bootstrap role")
+        }
+
+        #[tokio::test]
+        async fn runtime_privilege_rule_accepts_only_the_matrix() {
+            use PrivilegeViolation as V;
+
+            let (fixture, owner) = migrated().await;
+            let runtime_role = fixture.settings.database.user.clone();
+            let owner_role = fixture.owner.owner.clone();
+            assert_eq!(violations(&owner, &runtime_role).await, BTreeSet::new());
+            assert!(
+                violations(&owner, "pg_monitor")
+                    .await
+                    .contains(&V::Membership)
+            );
+            let bootstrap = bootstrap_role(&owner).await;
+            assert!(violations(&owner, &bootstrap).await.contains(&V::Attribute));
+            assert!(
+                violations(&owner, "docchain_no_such_role")
+                    .await
+                    .contains(&V::Attribute)
+            );
+            let of_owner = violations(&owner, &owner_role).await;
+            assert!(of_owner.contains(&V::ObjectOwner), "{of_owner:?}");
+            assert!(of_owner.contains(&V::SchemaPrivilege), "{of_owner:?}");
+
+            // One grant beyond the matrix at a time, each revoked afterwards.
+            let grant =
+                |statement: &str| sqlx::AssertSqlSafe(statement.replace("RUNTIME", &runtime_role));
+            for (granted, revoked, expected) in [
+                (
+                    "GRANT EXECUTE ON FUNCTION refuse_append_only_mutation() TO RUNTIME",
+                    "REVOKE EXECUTE ON FUNCTION refuse_append_only_mutation() FROM RUNTIME",
+                    V::FunctionPrivilege,
+                ),
+                (
+                    "GRANT USAGE ON SEQUENCE audit_events_sequence_seq TO RUNTIME",
+                    "REVOKE USAGE ON SEQUENCE audit_events_sequence_seq FROM RUNTIME",
+                    V::SequencePrivilege,
+                ),
+                (
+                    "GRANT SELECT ON audit_events TO RUNTIME WITH GRANT OPTION",
+                    "REVOKE GRANT OPTION FOR SELECT ON audit_events FROM RUNTIME",
+                    V::GrantOption,
+                ),
+                (
+                    "GRANT DELETE ON audit_events TO RUNTIME",
+                    "REVOKE DELETE ON audit_events FROM RUNTIME",
+                    V::TablePrivilege,
+                ),
+                (
+                    "GRANT UPDATE (sender_wallet) ON exchanges TO RUNTIME",
+                    "REVOKE UPDATE (sender_wallet) ON exchanges FROM RUNTIME",
+                    V::ColumnPrivilege,
+                ),
+                (
+                    "GRANT CREATE ON SCHEMA SCHEMA_NAME TO RUNTIME",
+                    "REVOKE CREATE ON SCHEMA SCHEMA_NAME FROM RUNTIME",
+                    V::SchemaPrivilege,
+                ),
+            ] {
+                let granted = granted.replace("SCHEMA_NAME", &fixture.schema);
+                let revoked = revoked.replace("SCHEMA_NAME", &fixture.schema);
+                sqlx::raw_sql(grant(&granted))
+                    .execute(&owner)
+                    .await
+                    .expect("grant");
+                let found = violations(&owner, &runtime_role).await;
+                assert!(found.contains(&expected), "{granted}: {found:?}");
+                sqlx::raw_sql(grant(&revoked))
+                    .execute(&owner)
+                    .await
+                    .expect("revoke");
+                assert_eq!(
+                    violations(&owner, &runtime_role).await,
+                    BTreeSet::new(),
+                    "{revoked}"
+                );
+            }
+
+            // A new owner table with no grant leaves the rule intact; a grant on it does not.
+            sqlx::raw_sql("CREATE TABLE unlisted (id BIGINT)")
+                .execute(&owner)
+                .await
+                .expect("new table");
+            assert_eq!(violations(&owner, &runtime_role).await, BTreeSet::new());
+            sqlx::raw_sql(grant("GRANT SELECT ON unlisted TO RUNTIME"))
+                .execute(&owner)
+                .await
+                .expect("grant on new table");
+            assert!(
+                violations(&owner, &runtime_role)
+                    .await
+                    .contains(&V::TablePrivilege)
+            );
+            // A listed relation that is missing is a mismatch too.
+            sqlx::raw_sql("DROP TABLE unlisted; ALTER TABLE acceptances RENAME TO renamed")
+                .execute(&owner)
+                .await
+                .expect("rename a listed table");
+            assert!(
+                violations(&owner, &runtime_role)
+                    .await
+                    .contains(&V::TablePrivilege)
+            );
+        }
+
+        #[tokio::test]
+        async fn runtime_state_left_uncommitted_breaks_the_rule_on_its_own_connection() {
+            let (fixture, _owner) = migrated().await;
+            let runtime = fixture.runtime_pool().await.expect("runtime pool");
+            let role = fixture.settings.database.user.clone();
+            for (statement, expected) in [
+                (
+                    "ALTER ROLE CURRENT_USER SET statement_timeout = '1min'",
+                    PrivilegeViolation::RoleSetting,
+                ),
+                ("SELECT lo_create(0)", PrivilegeViolation::ObjectOwner),
+            ] {
+                // Never committed on any path: dropping the transaction also rolls it back.
+                let mut transaction = runtime.begin().await.expect("transaction");
+                sqlx::raw_sql(sqlx::AssertSqlSafe(statement.to_owned()))
+                    .execute(&mut *transaction)
+                    .await
+                    .expect("runtime statement");
+                let found = runtime_privilege_violations(&mut transaction, &role)
+                    .await
+                    .expect("privilege check");
+                assert!(found.contains(&expected), "{statement}: {found:?}");
+                transaction.rollback().await.expect("rollback");
+                assert_eq!(violations(&runtime, &role).await, BTreeSet::new());
+            }
+        }
+
+        #[tokio::test]
+        async fn superuser_check_treats_unknown_roles_as_superusers() {
+            let (fixture, owner) = created().await;
+            let mut conn = owner.acquire().await.expect("connection");
+            let bootstrap = bootstrap_role(&owner).await;
+            for (role, expected) in [
+                (fixture.owner.owner.as_str(), false),
+                (fixture.settings.database.user.as_str(), false),
+                (bootstrap.as_str(), true),
+                ("docchain_no_such_role", true),
+            ] {
+                assert_eq!(
+                    role_is_superuser(&mut conn, role).await,
+                    Ok(expected),
+                    "{role}"
+                );
+            }
+            assert!(!session_is_superuser(&mut conn).await);
+        }
+
+        /// Owner connection options that set `docchain.runtime_role` to `runtime`, or not at
+        /// all.
+        fn owner_options_with(
+            fixture: &FixtureFiles,
+            runtime: Option<&str>,
+        ) -> sqlx::postgres::PgConnectOptions {
+            let owner = &fixture.owner;
+            let options = sqlx::postgres::PgConnectOptions::new_without_pgpass()
+                .host(&owner.host)
+                .port(owner.port)
+                .username(&owner.owner)
+                .password(owner.owner_password.expose())
+                .database(&owner.name)
+                .ssl_mode(sqlx::postgres::PgSslMode::Disable)
+                .options([("search_path", fixture.schema.as_str())]);
+            match runtime {
+                Some(runtime) => options.options([("docchain.runtime_role", runtime)]),
+                None => options,
+            }
+        }
+
+        #[tokio::test]
+        async fn grant_migration_refuses_an_unacceptable_runtime_role() {
+            let (probe, probe_owner) = created().await;
+            let bootstrap = bootstrap_role(&probe_owner).await;
+            let owner_role = probe.owner.owner.clone();
+            drop(probe_owner);
+            drop(probe);
+            for runtime in [
+                None,
+                Some(""),
+                Some("docchain_no_such_role"),
+                Some(owner_role.as_str()),
+                Some("pg_monitor"),
+                Some(bootstrap.as_str()),
+            ] {
+                let (fixture, owner) = created().await;
+                Migrator::new(EmbeddedMigrations)
+                    .await
+                    .expect("embedded migrations")
+                    .run_to(5, &owner)
+                    .await
+                    .expect("migrations 1 to 5");
+                let refused = crate::harness::guarded_pool(
+                    owner_options_with(&fixture, runtime),
+                    "owner refused",
+                )
+                .await
+                .expect("owner pool");
+                assert_eq!(
+                    migrate(&refused).await,
+                    Err(StoreError::Permanent),
+                    "{runtime:?}"
+                );
+                refused.close().await;
+                let versions: Vec<i64> =
+                    sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                        .fetch_all(&owner)
+                        .await
+                        .expect("recorded versions");
+                assert_eq!(versions, [1, 2, 3, 4, 5], "{runtime:?}");
+                if let Some(runtime) = runtime.filter(|name| !name.is_empty()) {
+                    let granted: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM pg_namespace AS namespace, \
+                         aclexplode(namespace.nspacl) AS entry \
+                         JOIN pg_roles AS role ON role.oid = entry.grantee \
+                         WHERE namespace.nspname = $1 AND role.rolname = $2)",
+                    )
+                    .bind(&fixture.schema)
+                    .bind(runtime)
+                    .fetch_one(&owner)
+                    .await
+                    .expect("schema grants");
+                    let acceptable = runtime == owner_role;
+                    assert!(!granted || acceptable, "{runtime}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn grant_migration_pins_triggers_and_search_paths() {
+            let (fixture, owner) = migrated().await;
+            let triggers: Vec<(String, String)> = sqlx::query_as(
+                "SELECT trigger_row.tgname::text, trigger_row.tgenabled::text \
+                 FROM pg_trigger AS trigger_row \
+                 JOIN pg_class AS relation ON relation.oid = trigger_row.tgrelid \
+                 WHERE relation.relnamespace = current_schema()::regnamespace \
+                     AND NOT trigger_row.tgisinternal ORDER BY 1",
+            )
+            .fetch_all(&owner)
+            .await
+            .expect("triggers");
+            assert_eq!(triggers.len(), 11, "{triggers:?}");
+            assert!(
+                triggers.iter().all(|(_, enabled)| enabled == "A"),
+                "{triggers:?}"
+            );
+            let functions: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+                "SELECT proname::text, proconfig FROM pg_proc \
+                 WHERE pronamespace = current_schema()::regnamespace ORDER BY 1",
+            )
+            .fetch_all(&owner)
+            .await
+            .expect("functions");
+            let pinned = Some(vec![format!("search_path={}, pg_temp", fixture.schema)]);
+            assert_eq!(
+                functions,
+                [
+                    ("credit_transaction_is_balanced".to_owned(), pinned.clone()),
+                    ("refuse_acceptance_reset".to_owned(), pinned.clone()),
+                    ("refuse_append_only_mutation".to_owned(), pinned),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn credit_snapshot_groups_the_ledger_within_its_bound() {
+            use crate::providers::AuditKey;
+
+            let (fixture, owner) = migrated().await;
+            let integrity = AuditKey::load(&fixture.root.join("audit.key")).expect("audit key");
+            let store = PgExchangeStore::new(fixture.runtime_pool().await.expect("runtime pool"));
+            let record = |index: u8| ExchangeRecord {
+                exchange_id: ExchangeId::new(format!(
+                    "exc_000000000000000000000000000000{index:02}"
+                ))
+                .expect("exchange"),
+                sender: WalletId::new("wal_0000000000000001").expect("wallet"),
+                recipient: WalletId::new("wal_0000000000000002").expect("wallet"),
+                document_id: DocumentId::new("doc_0000000000000001").expect("document"),
+                document_version: DocumentVersion::new(u64::from(index)).expect("version"),
+                request_nonce: RequestNonce::new([index; 16]),
+                idempotency_key: IdempotencyKey::new(format!("idem_00000000000000{index:02}"))
+                    .expect("key"),
+                schema_id: "urn:docchain:schema:service-application:1.0.0".to_owned(),
+                schema_version: "1.0.0".to_owned(),
+                object_id: ObjectId::new(format!("obj_000000000000000000000000000000{index:02}"))
+                    .expect("object"),
+                envelope_commitment: [index; 32],
+                protected_hash: [2; 32],
+                envelope_version: 1,
+                registry_sequence: 3,
+                committed_at: Timestamp::from_unix_seconds(86_400),
+                accepted: false,
+            };
+            let draft = |record: &ExchangeRecord, kind| EventDraft {
+                kind,
+                exchange_id: record.exchange_id.clone(),
+                object_id: record.object_id.clone(),
+                envelope_commitment: record.envelope_commitment,
+                envelope_version: record.envelope_version,
+                protected_hash: record.protected_hash,
+                sender: record.sender.clone(),
+                recipient: record.recipient.clone(),
+                document_id: record.document_id.clone(),
+                document_version: record.document_version,
+                registry_sequence: record.registry_sequence,
+                committed_at: record.committed_at,
+            };
+            let accept = |record: ExchangeRecord, key: &'static str| {
+                let store = &store;
+                let integrity = &integrity;
+                async move {
+                    store
+                        .commit_acceptance(
+                            &record.exchange_id,
+                            &IdempotencyKey::new(key).expect("key"),
+                            &CreditPosting {
+                                eligibility_key: docchain_domain::acceptance_eligibility_key(
+                                    &record.exchange_id,
+                                ),
+                                wallet: record.sender.clone(),
+                                amount: 1,
+                            },
+                            draft(&record, EventKind::Accepted),
+                            integrity,
+                        )
+                        .await
+                        .expect("acceptance")
+                }
+            };
+
+            let empty = store.credit_snapshot(10).await.expect("empty ledger");
+            assert_eq!(empty.snapshot.event_count(), 0);
+            assert!(empty.transactions.is_empty());
+            for index in 1..=2 {
+                store
+                    .commit_send(
+                        &record(index),
+                        draft(&record(index), EventKind::Delivered),
+                        &integrity,
+                        100,
+                    )
+                    .await
+                    .expect("send");
+            }
+            accept(record(1), "idem_accept0000000001").await;
+
+            let read = store.credit_snapshot(10).await.expect("ledger");
+            assert_eq!(read.snapshot.event_count(), 3);
+            assert_eq!(
+                read.transactions,
+                [CreditLedgerTransaction {
+                    eligibility_key: format!("acceptance:{}", record(1).exchange_id),
+                    exchange_id: Some(record(1).exchange_id.to_string()),
+                    entries: vec![
+                        CreditLedgerEntry {
+                            account: "issuance".to_owned(),
+                            amount: -1,
+                        },
+                        CreditLedgerEntry {
+                            account: "wal_0000000000000001".to_owned(),
+                            amount: 1,
+                        },
+                    ],
+                }]
+            );
+            assert_eq!(
+                store.credit_snapshot(0).await.map(|_| ()),
+                Err(AuditReadError::Exhausted)
+            );
+
+            // An acceptance committed after a snapshot is in neither its tail nor its ledger.
+            accept(record(2), "idem_accept0000000002").await;
+            assert_eq!(read.snapshot.event_count(), 3);
+            assert_eq!(read.transactions.len(), 1);
+            let later = store.credit_snapshot(10).await.expect("later ledger");
+            assert_eq!(
+                (later.snapshot.event_count(), later.transactions.len()),
+                (4, 2)
+            );
+
+            // Entries without a transaction, and a transaction without entries, as the owner
+            // could store them, are returned as they are.
+            sqlx::raw_sql(
+                "ALTER TABLE credit_entries DROP CONSTRAINT credit_entries_eligibility_key_fkey; \
+                 ALTER TABLE credit_transactions DISABLE TRIGGER credit_transactions_balanced; \
+                 ALTER TABLE credit_transactions DROP CONSTRAINT credit_transactions_exchange_id_key; \
+                 INSERT INTO credit_entries VALUES ('orphan', 'wal_0000000000000003', 1); \
+                 INSERT INTO credit_transactions \
+                 SELECT 'lonely', exchange_id FROM credit_transactions LIMIT 1",
+            )
+            .execute(&owner)
+            .await
+            .expect("owner tampering");
+            let tampered = store.credit_snapshot(10).await.expect("tampered ledger");
+            let shapes = tampered
+                .transactions
+                .iter()
+                .map(|transaction| {
+                    (
+                        transaction.eligibility_key.as_str(),
+                        transaction.exchange_id.is_some(),
+                        transaction.entries.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                shapes,
+                [
+                    (
+                        format!("acceptance:{}", record(1).exchange_id).as_str(),
+                        true,
+                        2
+                    ),
+                    (
+                        format!("acceptance:{}", record(2).exchange_id).as_str(),
+                        true,
+                        2
+                    ),
+                    ("lonely", true, 0),
+                    ("orphan", false, 1),
+                ]
+            );
+            assert_eq!(
+                store.credit_snapshot(2).await.map(|_| ()),
+                Err(AuditReadError::Exhausted)
+            );
         }
     }
 }

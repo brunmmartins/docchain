@@ -274,6 +274,16 @@ struct AuditDto {
     valid: bool,
     event_count: usize,
     head: Option<CheckpointDto>,
+    credits: CreditReconciliationDto,
+}
+
+/// Every accepted exchange has exactly one balanced credit transaction, and every credit
+/// transaction belongs to exactly one accepted exchange. Counts only; no identifier.
+#[derive(Serialize)]
+struct CreditReconciliationDto {
+    reconciled: bool,
+    accepted_exchanges: usize,
+    credit_transactions: usize,
 }
 
 /// A signed chain head. An auditor keeps the one it last verified and presents it again, so
@@ -491,6 +501,11 @@ async fn verify_audit(
             event_hash: URL_SAFE_NO_PAD.encode(head.event_hash),
             signature: URL_SAFE_NO_PAD.encode(head.signature),
         }),
+        credits: CreditReconciliationDto {
+            reconciled: true,
+            accepted_exchanges: report.credits.accepted_exchanges(),
+            credit_transactions: report.credits.credit_transactions(),
+        },
     }))
 }
 
@@ -579,18 +594,27 @@ impl From<ServiceError> for ApiError {
 #[derive(Serialize)]
 struct Problem {
     category: &'static str,
+    /// Only an audit verification failure carries a reason: the class of check that failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, category) = match self {
+        let (status, category) = match &self {
             Self::Unauthenticated => (StatusCode::UNAUTHORIZED, "unauthenticated"),
             Self::InvalidRequest => (StatusCode::UNPROCESSABLE_ENTITY, "invalid-request"),
             Self::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
-            Self::Service(error) => service_problem(&error),
+            Self::Service(error) => service_problem(error),
         };
-        (status, Json(Problem { category })).into_response()
+        let reason = match self {
+            Self::Service(ServiceError::Application(ApplicationError::AuditMismatch(mismatch))) => {
+                Some(mismatch.as_str())
+            }
+            _ => None,
+        };
+        (status, Json(Problem { category, reason })).into_response()
     }
 }
 
@@ -614,7 +638,9 @@ fn service_problem(error: &ServiceError) -> (StatusCode, &'static str) {
             | ApplicationError::PendingLimit
             | ApplicationError::InvalidEnvelope,
         ) => StatusCode::UNPROCESSABLE_ENTITY,
-        ServiceError::Application(ApplicationError::IntegrityFailure) => StatusCode::CONFLICT,
+        ServiceError::Application(
+            ApplicationError::IntegrityFailure | ApplicationError::AuditMismatch(_),
+        ) => StatusCode::CONFLICT,
         ServiceError::Application(ApplicationError::AuditIncomplete) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
@@ -1312,6 +1338,15 @@ mod tests {
             ),
             (1.into(), 1.into())
         );
+        // No exchange is accepted yet, so the reconciled ledger is empty.
+        assert_eq!(
+            audit.json()["credits"],
+            serde_json::json!({"reconciled": true, "accepted_exchanges": 0, "credit_transactions": 0})
+        );
+        assert_eq!(
+            keys(&audit.json()),
+            ["credits", "event_count", "head", "valid"]
+        );
         let held = format!(
             "/v1/audit/verify?head_sequence=1&head_event_hash={}&head_signature={}",
             head["event_hash"].as_str().expect("hash"),
@@ -1328,7 +1363,7 @@ mod tests {
         assert_eq!(truncated.status, 409);
         assert_eq!(
             truncated.json(),
-            serde_json::json!({"category": "integrity-failure"})
+            serde_json::json!({"category": "integrity-failure", "reason": "event-chain"})
         );
         let malformed = send(
             app(),

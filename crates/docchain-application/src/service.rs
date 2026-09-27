@@ -4,18 +4,18 @@
 //! mutation commits through one store transaction guarded by uniqueness rules, so a replay or a
 //! cancelled call cannot produce a second event, envelope, delivery, acceptance, or credit.
 
-use std::fmt::Write as _;
+use std::{collections::BTreeMap, fmt::Write as _};
 
 use docchain_domain::{
     AuditExportManifest, CompiledSchema, EventDraft, EventKind, ExchangeId, IdempotencyKey,
-    ObjectId, WalletId, envelope_commitment, event_signature_input, parse_document, sha256,
-    verify_event_chain,
+    ObjectId, WalletId, acceptance_eligibility_key, envelope_commitment, event_signature_input,
+    parse_document, reconcile_credits, sha256, verify_event_chain,
 };
 
 use crate::{
     AcceptanceResult, Actor, ApplicationError, AuditExportEvent, AuditExportPage,
-    AuditExportRequest, AuditPublicKey, AuditReport, AuditSettings, Coverage, Credential, Delivery,
-    Limits, Plaintext, SendCopyCommand,
+    AuditExportRequest, AuditMismatch, AuditPublicKey, AuditReport, AuditSettings, Coverage,
+    Credential, Delivery, Limits, Plaintext, SendCopyCommand,
     model::AuditExportKind,
     ports::{
         AcceptanceOutcome, Adapters, AuditEventStore as _, AuditReadError, AuditReadRequest,
@@ -283,7 +283,7 @@ impl<A: Adapters> Application<A> {
             .ok_or(ApplicationError::Forbidden)?;
         if !record.accepted {
             let credit = CreditPosting {
-                eligibility_key: format!("acceptance:{}", record.exchange_id),
+                eligibility_key: acceptance_eligibility_key(&record.exchange_id),
                 wallet: record.sender.clone(),
                 amount: 1,
             };
@@ -357,7 +357,13 @@ impl<A: Adapters> Application<A> {
             .map_err(store_error)
     }
 
-    /// Verifies the signed event chain and every envelope commitment, without plaintext.
+    /// Verifies the signed event chain, every envelope commitment, and the credit ledger,
+    /// without plaintext.
+    ///
+    /// The chain tail and the whole credit ledger are read together in one snapshot, and the
+    /// event pages are then read against that tail, so a concurrent acceptance cannot produce a
+    /// false mismatch. Every accepted exchange must have exactly one balanced credit
+    /// transaction, and every credit transaction must belong to exactly one accepted exchange.
     ///
     /// With `expected`, the chain must still contain that earlier head, so rollback at or before
     /// that checkpoint is detected. A first call without one establishes a baseline only: this
@@ -365,50 +371,36 @@ impl<A: Adapters> Application<A> {
     ///
     /// # Errors
     ///
-    /// [`ApplicationError::Forbidden`] unless the actor is an auditor;
-    /// [`ApplicationError::IntegrityFailure`] on any failed check.
+    /// [`ApplicationError::Forbidden`] unless the actor is an auditor, before any read;
+    /// [`ApplicationError::AuditIncomplete`] when the chain or the ledger exceeds the bound;
+    /// [`ApplicationError::AuditMismatch`] with the first failing class, checked in the order
+    /// chain, envelopes, credits.
     pub async fn verify_audit(
         &self,
         actor: &Actor,
         expected: Option<docchain_domain::Checkpoint>,
     ) -> Result<AuditReport, ApplicationError> {
+        const CHAIN: ApplicationError = ApplicationError::AuditMismatch(AuditMismatch::EventChain);
+        const ENVELOPE: ApplicationError =
+            ApplicationError::AuditMismatch(AuditMismatch::EnvelopeCommitment);
+
         if *actor != Actor::Auditor {
             return Err(ApplicationError::Forbidden);
         }
-        let mut stored = self
+        let credit_snapshot = self
             .adapters
             .audit_events()
-            .page(AuditReadRequest {
-                snapshot: None,
-                after_sequence: 0,
-                limit: 500,
-            })
+            .credit_snapshot(self.limits.audit_events)
             .await
-            .map_err(audit_read_error)?;
-        if stored.snapshot.event_count() > u64::from(self.limits.audit_events) {
+            .map_err(verify_read_error)?;
+        let snapshot = credit_snapshot.snapshot;
+        if snapshot.event_count() > u64::from(self.limits.audit_events) {
             return Err(ApplicationError::AuditIncomplete);
         }
-        let snapshot = stored.snapshot;
         let mut after_sequence = 0;
         let mut events = Vec::new();
         loop {
-            // Every page must advance the cursor, so a faulty adapter cannot loop forever.
-            let has_more = stored.has_more;
-            let Some(last) = stored.events.last().map(|event| event.sequence) else {
-                if has_more {
-                    return Err(ApplicationError::IntegrityFailure);
-                }
-                break;
-            };
-            if last <= after_sequence {
-                return Err(ApplicationError::IntegrityFailure);
-            }
-            after_sequence = last;
-            events.extend(stored.events);
-            if !has_more {
-                break;
-            }
-            stored = self
+            let stored = self
                 .adapters
                 .audit_events()
                 .page(AuditReadRequest {
@@ -417,19 +409,35 @@ impl<A: Adapters> Application<A> {
                     limit: 500,
                 })
                 .await
-                .map_err(audit_read_error)?;
+                .map_err(verify_read_error)?;
             if stored.snapshot != snapshot {
-                return Err(ApplicationError::IntegrityFailure);
+                return Err(CHAIN);
+            }
+            // Every page must advance the cursor, so a faulty adapter cannot loop forever.
+            let has_more = stored.has_more;
+            let Some(last) = stored.events.last().map(|event| event.sequence) else {
+                if has_more {
+                    return Err(CHAIN);
+                }
+                break;
+            };
+            if last <= after_sequence {
+                return Err(CHAIN);
+            }
+            after_sequence = last;
+            events.extend(stored.events);
+            if !has_more {
+                break;
             }
         }
         if u64::try_from(events.len()).ok() != Some(snapshot.event_count()) {
-            return Err(ApplicationError::IntegrityFailure);
+            return Err(CHAIN);
         }
         let integrity = self.adapters.integrity();
         let head = verify_event_chain(&events, expected.as_ref(), |input, signature| {
             integrity.verify(input, signature).is_ok()
         })
-        .map_err(|_| ApplicationError::IntegrityFailure)?;
+        .map_err(|_| CHAIN)?;
         for event in &events {
             let envelope = self
                 .adapters
@@ -437,17 +445,17 @@ impl<A: Adapters> Application<A> {
                 .get(&event.draft.object_id)
                 .await
                 .map_err(|error| match error {
-                    StoreError::NotFound => ApplicationError::IntegrityFailure,
+                    StoreError::NotFound => ENVELOPE,
                     other => store_error(other),
                 })?;
             if envelope_commitment(&envelope) != event.draft.envelope_commitment {
-                return Err(ApplicationError::IntegrityFailure);
+                return Err(ENVELOPE);
             }
             let header = self
                 .adapters
                 .crypto()
                 .inspect(&envelope)
-                .map_err(|_| ApplicationError::IntegrityFailure)?;
+                .map_err(|_| ENVELOPE)?;
             if header.protected_hash != event.draft.protected_hash
                 || header.envelope_version != event.draft.envelope_version
                 || header.document_id != event.draft.document_id
@@ -459,12 +467,27 @@ impl<A: Adapters> Application<A> {
                     &event.draft.recipient,
                 )
             {
-                return Err(ApplicationError::IntegrityFailure);
+                return Err(ENVELOPE);
             }
         }
+        let mut accepted = BTreeMap::new();
+        for event in events
+            .iter()
+            .filter(|event| event.draft.kind == EventKind::Accepted)
+        {
+            if accepted
+                .insert(event.draft.exchange_id.clone(), event.draft.sender.clone())
+                .is_some()
+            {
+                return Err(CHAIN);
+            }
+        }
+        let credits = reconcile_credits(&accepted, &credit_snapshot.transactions)
+            .map_err(|mismatch| ApplicationError::AuditMismatch(mismatch.into()))?;
         Ok(AuditReport {
             event_count: events.len(),
             head,
+            credits,
         })
     }
 
@@ -925,6 +948,19 @@ fn audit_read_error(error: AuditReadError) -> ApplicationError {
         AuditReadError::SnapshotChanged | AuditReadError::Invariant => {
             ApplicationError::IntegrityFailure
         }
+        AuditReadError::Exhausted => ApplicationError::AuditIncomplete,
+        AuditReadError::Transient | AuditReadError::Permanent => ApplicationError::Unavailable,
+    }
+}
+
+/// Maps a read failure inside audit verification: a changed or broken snapshot is a chain
+/// failure, and a ledger beyond the bound is an incomplete audit.
+fn verify_read_error(error: AuditReadError) -> ApplicationError {
+    match error {
+        AuditReadError::SnapshotChanged | AuditReadError::Invariant => {
+            ApplicationError::AuditMismatch(AuditMismatch::EventChain)
+        }
+        AuditReadError::Exhausted => ApplicationError::AuditIncomplete,
         AuditReadError::Transient | AuditReadError::Permanent => ApplicationError::Unavailable,
     }
 }

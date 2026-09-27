@@ -16,13 +16,18 @@ use docchain_domain::{Checkpoint, ExchangeId, IdempotencyKey, WalletId};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use thiserror::Error;
 
+#[cfg(feature = "test-support")]
+use crate::config::MigrationSettings;
 use crate::{
     config::{DatabaseSettings, Settings},
     crypto::CryptoEngine,
     providers::{
         AuditKey, FileIdentity, FileKeyRegistry, StaticSchemaRegistry, SystemClock, load_key_files,
     },
-    store::{FileDocumentStore, PgExchangeStore, migrate},
+    store::{
+        FileDocumentStore, MigrationState, PgExchangeStore, migration_state,
+        runtime_privilege_violations, schema_exists, session_roles,
+    },
 };
 
 /// Concrete statically-dispatched local adapters.
@@ -108,7 +113,9 @@ impl ServiceError {
                 ApplicationError::Replay => "replay",
                 ApplicationError::PendingLimit => "pending-limit",
                 ApplicationError::InvalidEnvelope => "invalid-envelope",
-                ApplicationError::IntegrityFailure => "integrity-failure",
+                ApplicationError::IntegrityFailure | ApplicationError::AuditMismatch(_) => {
+                    "integrity-failure"
+                }
                 ApplicationError::AuditIncomplete => "audit-incomplete",
                 ApplicationError::Unavailable | ApplicationError::Invariant => "dependency-failure",
             },
@@ -133,13 +140,42 @@ pub(crate) fn connect_options(database: &DatabaseSettings) -> PgConnectOptions {
         .options([("search_path", database.schema.as_str())])
 }
 
+/// Connection options for the migration owner: the configured schema is the only
+/// `search_path`, and `docchain.runtime_role` names the role migrations grant to.
+pub(crate) fn migration_connect_options(
+    settings: &crate::config::MigrationSettings,
+) -> PgConnectOptions {
+    PgConnectOptions::new_without_pgpass()
+        .host(&settings.host)
+        .port(settings.port)
+        .username(&settings.owner)
+        .password(settings.owner_password.expose())
+        .database(&settings.name)
+        .ssl_mode(PgSslMode::Disable)
+        .application_name("docchain-migrate")
+        .options([
+            ("search_path", settings.schema.as_str()),
+            ("docchain.runtime_role", settings.runtime_role.as_str()),
+        ])
+}
+
 /// Fully composed local service. HTTP and test adapters call these use cases.
 pub struct DocchainService {
     application: Application<ServerAdapters>,
 }
 
 impl DocchainService {
-    /// Migrates the configured database schema and wires every adapter.
+    /// Checks the configured database schema and role, then wires every adapter.
+    ///
+    /// It never applies migrations. Before any adapter is built, and so before anything can
+    /// listen, it checks in order: that the schema exists, that every embedded migration is
+    /// applied unchanged, that the connection's schema is the configured one, and that the
+    /// connected role is its own session role and satisfies the runtime privilege rule.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Initialization`] naming the first failed step, never a user, password,
+    /// path, SQL error, or which part of the privilege rule failed.
     pub async fn compose(settings: &Settings) -> Result<Self, ServiceError> {
         Self::compose_with_limits(settings, Limits::default()).await
     }
@@ -156,16 +192,7 @@ impl DocchainService {
             .connect_with(options)
             .await
             .map_err(|_| ServiceError::Initialization("database connection"))?;
-        let current_schema: String = sqlx::query_scalar("SELECT current_schema()")
-            .fetch_one(&pool)
-            .await
-            .map_err(|_| ServiceError::Initialization("database schema"))?;
-        if current_schema != database.schema.as_str() {
-            return Err(ServiceError::Initialization("database schema"));
-        }
-        migrate(&pool)
-            .await
-            .map_err(|_| ServiceError::Initialization("database migration"))?;
+        check_database(&pool, database.schema.as_str()).await?;
 
         let signing = load_key_files(&settings.keys.wallet_signing_private)
             .map_err(|_| ServiceError::Initialization("wallet signing key files"))?;
@@ -299,9 +326,48 @@ impl DocchainService {
             .map_err(Into::into)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn pool(&self) -> &sqlx::PgPool {
         self.application.adapters().exchanges.pool()
+    }
+}
+
+/// The read-only startup checks on one pooled connection, in order, each failing with its own
+/// step name.
+async fn check_database(pool: &sqlx::PgPool, schema: &str) -> Result<(), ServiceError> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|_| ServiceError::Initialization("database connection"))?;
+    if !matches!(schema_exists(&mut conn, schema).await, Ok(true)) {
+        return Err(ServiceError::Initialization("database schema"));
+    }
+    match migration_state(&mut conn, schema).await {
+        Ok(MigrationState::Current) => {}
+        Ok(MigrationState::Mismatch) => {
+            return Err(ServiceError::Initialization("database migrations mismatch"));
+        }
+        Ok(MigrationState::Pending) | Err(_) => {
+            return Err(ServiceError::Initialization("database migrations pending"));
+        }
+    }
+    let current_schema: Option<String> = sqlx::query_scalar("SELECT current_schema()::text")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| ServiceError::Initialization("database schema"))?;
+    if current_schema.as_deref() != Some(schema) {
+        return Err(ServiceError::Initialization("database schema"));
+    }
+    let role_privileges = ServiceError::Initialization("database role privileges");
+    let (session, current) = session_roles(&mut conn)
+        .await
+        .map_err(|_| ServiceError::Initialization("database role privileges"))?;
+    if session != current {
+        return Err(role_privileges);
+    }
+    match runtime_privilege_violations(&mut conn, &current).await {
+        Ok(violations) if violations.is_empty() => Ok(()),
+        _ => Err(role_privileges),
     }
 }
 
@@ -320,7 +386,7 @@ pub struct StateStats {
 #[cfg(feature = "test-support")]
 pub struct DemoHarness {
     service: Arc<DocchainService>,
-    fixture: FixtureFiles,
+    database: DatabaseFixture,
     pub sender_credential: String,
     pub recipient_credential: String,
     pub unrelated_credential: String,
@@ -332,32 +398,55 @@ pub struct DemoHarness {
 
 /// One test's invented key files, settings, PostgreSQL schema name, and document root.
 ///
-/// Dropping it drops the schema, if it was created, and removes the root, within five seconds,
-/// also when a test panics.
+/// The migration owner creates, migrates, inspects, and drops the schema; the service under
+/// test uses only the runtime credential. Dropping it drops the schema, if it was created, and
+/// removes the root, within five seconds, also when a test panics.
 #[cfg(feature = "test-support")]
 pub(crate) struct FixtureFiles {
     pub(crate) schema: String,
     pub(crate) root: std::path::PathBuf,
     pub(crate) object_root: std::path::PathBuf,
+    /// The server's settings, with the runtime credential only.
     pub(crate) settings: Settings,
+    /// The migration owner's settings.
+    pub(crate) owner: MigrationSettings,
     /// Verifier-side copy of the product-owner trust anchor, separate from server settings.
     expected_audit_fingerprint: [u8; 32],
-    /// Every `DOCCHAIN_` variable the settings came from.
+    /// Every `DOCCHAIN_` variable the server settings came from; no migration owner key.
     environment: Vec<(String, String)>,
+    /// The `DOCCHAIN_` variables `docchain-migrate` reads; no runtime password.
+    migration_environment: Vec<(String, String)>,
     credentials: [String; 6],
+}
+
+/// The process environment, keeping only Unicode variables.
+#[cfg(feature = "test-support")]
+fn process_environment() -> std::collections::HashMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 #[cfg(feature = "test-support")]
 impl FixtureFiles {
     /// Writes the fixture files under a new temporary root and builds settings naming a new,
-    /// not yet created, schema.
+    /// not yet created, schema, from the process environment.
     pub(crate) fn write() -> Result<Self, ServiceError> {
-        Self::write_with(None)
+        Self::write_with(process_environment(), None)
     }
 
-    /// As [`FixtureFiles::write`], appending one authority-signed revocation of the recipient's
-    /// encryption key, at the next registry sequence, that takes effect at `not_before`.
-    fn write_with(revocation_from: Option<&str>) -> Result<Self, ServiceError> {
+    /// As [`FixtureFiles::write`], from the `base` environment, and, with `revocation_from`,
+    /// appending one authority-signed revocation of the recipient's encryption key, at the next
+    /// registry sequence, that takes effect at that time.
+    ///
+    /// The runtime credential comes from the `DOCCHAIN_DATABASE__*` keys and the owner
+    /// credential from the `DOCCHAIN_MIGRATION__*` keys; a missing key fails the fixture and
+    /// names the key. No `DOCCHAIN_MIGRATION__*` key reaches the server settings or the server
+    /// environment.
+    fn write_with(
+        base: std::collections::HashMap<String, String>,
+        revocation_from: Option<&str>,
+    ) -> Result<Self, ServiceError> {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         use serde_json::{Value, json};
         use std::{
@@ -484,30 +573,28 @@ impl FixtureFiles {
         )?;
 
         let object_root = root.join("objects");
-        let mut values: HashMap<String, String> = std::env::vars_os()
-            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-            .collect();
-        values
-            .entry("DOCCHAIN_DATABASE__HOST".to_owned())
-            .or_insert_with(|| "postgres".to_owned());
-        values
-            .entry("DOCCHAIN_DATABASE__NAME".to_owned())
-            .or_insert_with(|| {
-                std::env::var("POSTGRES_DB").unwrap_or_else(|_| "docchain".to_owned())
-            });
-        values
-            .entry("DOCCHAIN_DATABASE__USER".to_owned())
-            .or_insert_with(|| {
-                std::env::var("POSTGRES_USER").unwrap_or_else(|_| "docchain".to_owned())
-            });
-        if !values.contains_key("DOCCHAIN_DATABASE__PASSWORD")
-            && !values.contains_key("DOCCHAIN_DATABASE__PASSWORD_FILE")
+        let mut values: HashMap<String, String> = base;
+        let present = |key: &str| values.get(key).is_some_and(|value| !value.is_empty());
+        if !present("DOCCHAIN_DATABASE__USER") {
+            return Err(ServiceError::Initialization(
+                "test fixture requires DOCCHAIN_DATABASE__USER",
+            ));
+        }
+        if !present("DOCCHAIN_DATABASE__PASSWORD") && !present("DOCCHAIN_DATABASE__PASSWORD_FILE") {
+            return Err(ServiceError::Initialization(
+                "test fixture requires DOCCHAIN_DATABASE__PASSWORD_FILE",
+            ));
+        }
+        if !present("DOCCHAIN_MIGRATION__USER") {
+            return Err(ServiceError::Initialization(
+                "test fixture requires DOCCHAIN_MIGRATION__USER",
+            ));
+        }
+        if !present("DOCCHAIN_MIGRATION__PASSWORD") && !present("DOCCHAIN_MIGRATION__PASSWORD_FILE")
         {
-            values.insert(
-                "DOCCHAIN_DATABASE__PASSWORD_FILE".to_owned(),
-                std::env::var("POSTGRES_PASSWORD_FILE")
-                    .unwrap_or_else(|_| "/run/secrets/postgres_key".to_owned()),
-            );
+            return Err(ServiceError::Initialization(
+                "test fixture requires DOCCHAIN_MIGRATION__PASSWORD_FILE",
+            ));
         }
         for (key, value) in [
             ("DOCCHAIN_DATABASE__SCHEMA", schema.clone()),
@@ -555,21 +642,41 @@ impl FixtureFiles {
         ] {
             values.insert(key.to_owned(), value);
         }
+        let migration_environment: Vec<(String, String)> = values
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with("DOCCHAIN_MIGRATION__")
+                    || [
+                        "DOCCHAIN_DATABASE__HOST",
+                        "DOCCHAIN_DATABASE__PORT",
+                        "DOCCHAIN_DATABASE__NAME",
+                        "DOCCHAIN_DATABASE__SCHEMA",
+                        "DOCCHAIN_DATABASE__USER",
+                    ]
+                    .contains(&key.as_str())
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let owner = MigrationSettings::from_map(migration_environment.iter().cloned().collect())
+            .map_err(|_| ServiceError::Initialization("test fixture migration owner settings"))?;
+        values.retain(|key, _| !key.starts_with("DOCCHAIN_MIGRATION__"));
         let environment = values
             .iter()
             .filter(|(key, _)| key.starts_with("DOCCHAIN_"))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let settings =
-            Settings::from_map(values).map_err(|_| ServiceError::Initialization("test fixture"))?;
+        let settings = Settings::from_map(values)
+            .map_err(|_| ServiceError::Initialization("test fixture runtime settings"))?;
 
         Ok(Self {
             schema,
             root,
             object_root,
             settings,
+            owner,
             expected_audit_fingerprint,
             environment,
+            migration_environment,
             credentials: [
                 sender_credential,
                 recipient_credential,
@@ -581,50 +688,92 @@ impl FixtureFiles {
         })
     }
 
-    /// Options for an administrative connection, outside any fixture schema.
-    fn admin_options(&self) -> PgConnectOptions {
-        connect_options(&self.settings.database)
-            .application_name("docchain-test-admin")
-            .options([("search_path", "public")])
+    /// Options for the migration owner's connections to the fixture schema.
+    fn owner_options(&self) -> PgConnectOptions {
+        migration_connect_options(&self.owner).application_name("docchain-test-owner")
     }
 
-    /// Creates the fixture's schema.
-    pub(crate) async fn create_schema(&self) -> Result<(), ServiceError> {
-        use sqlx::{AssertSqlSafe, Executor as _};
-
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect_with(self.admin_options())
-            .await
-            .map_err(|_| ServiceError::Initialization("test fixture"))?;
-        let created = admin
-            .execute(AssertSqlSafe(format!("CREATE SCHEMA {}", self.schema)))
-            .await;
-        admin.close().await;
-        created
-            .map(|_| ())
-            .map_err(|_| ServiceError::Initialization("test fixture"))
+    /// A pool of the migration owner's connections, refused when its session is a superuser's.
+    pub(crate) async fn owner_pool(&self) -> Result<sqlx::PgPool, ServiceError> {
+        guarded_pool(
+            self.owner_options(),
+            "test fixture refuses a superuser as DOCCHAIN_MIGRATION__USER",
+        )
+        .await
     }
 
-    /// A pool confined to the fixture's schema, as the service connects.
-    #[cfg(test)]
-    pub(crate) async fn pool(&self) -> Result<sqlx::PgPool, ServiceError> {
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(connect_options(&self.settings.database))
+    /// A pool of runtime connections confined to the fixture's schema, as the service connects,
+    /// refused when its session is a superuser's.
+    pub(crate) async fn runtime_pool(&self) -> Result<sqlx::PgPool, ServiceError> {
+        guarded_pool(
+            connect_options(&self.settings.database).application_name("docchain-test-runtime"),
+            "test fixture refuses a superuser as DOCCHAIN_DATABASE__USER",
+        )
+        .await
+    }
+
+    /// Creates the fixture's schema, owned by the migration owner.
+    pub(crate) async fn create_schema(&self, owner: &sqlx::PgPool) -> Result<(), ServiceError> {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA {}",
+            self.schema
+        )))
+        .execute(owner)
+        .await
+        .map(|_| ())
+        .map_err(|_| ServiceError::Initialization("test fixture schema"))
+    }
+
+    /// Applies every embedded migration as the owner. A failed run's connection is closed, so
+    /// SQLx's database-wide migration lock is released.
+    pub(crate) async fn migrate(&self, owner: &sqlx::PgPool) -> Result<(), ServiceError> {
+        let mut conn = owner
+            .acquire()
             .await
-            .map_err(|_| ServiceError::Initialization("test fixture"))
+            .map_err(|_| ServiceError::Initialization("test fixture migration"))?;
+        match crate::store::migrate_schema(&mut conn).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let _ = conn.close().await;
+                Err(ServiceError::Initialization("test fixture migration"))
+            }
+        }
     }
 
     /// Whether a schema with the fixture's name exists.
     #[cfg(test)]
     pub(crate) async fn schema_exists(&self) -> Result<bool, ServiceError> {
-        schema_exists(self.admin_options(), &self.schema).await
+        schema_exists_as(self.owner_options(), &self.schema).await
     }
 }
 
+/// Connects a pool, then refuses it unless neither the session nor the current role of its
+/// connection is a superuser. `refusal` names the key that configured the role.
+#[cfg(feature = "test-support")]
+pub(crate) async fn guarded_pool(
+    options: PgConnectOptions,
+    refusal: &'static str,
+) -> Result<sqlx::PgPool, ServiceError> {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with(options)
+        .await
+        .map_err(|_| ServiceError::Initialization("test fixture connection"))?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|_| ServiceError::Initialization("test fixture connection"))?;
+    if crate::store::session_is_superuser(&mut conn).await {
+        drop(conn);
+        pool.close().await;
+        return Err(ServiceError::Initialization(refusal));
+    }
+    Ok(pool)
+}
+
 #[cfg(all(test, feature = "test-support"))]
-async fn schema_exists(options: PgConnectOptions, schema: &str) -> Result<bool, ServiceError> {
+async fn schema_exists_as(options: PgConnectOptions, schema: &str) -> Result<bool, ServiceError> {
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(options)
@@ -642,7 +791,7 @@ async fn schema_exists(options: PgConnectOptions, schema: &str) -> Result<bool, 
 #[cfg(feature = "test-support")]
 impl Drop for FixtureFiles {
     fn drop(&mut self) {
-        let options = self.admin_options();
+        let options = self.owner_options();
         let schema = self.schema.clone();
         let root = self.root.clone();
         // A separate thread and runtime, so cleanup also works while a test's own runtime is
@@ -654,16 +803,15 @@ impl Drop for FixtureFiles {
             if let Ok(runtime) = runtime {
                 runtime.block_on(async move {
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                        if let Ok(admin) = PgPoolOptions::new()
-                            .max_connections(1)
-                            .connect_with(options)
-                            .await
-                        {
-                            let statement = format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
-                            let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
-                                .execute(&admin)
-                                .await;
-                            admin.close().await;
+                        if let Ok(mut admin) = sqlx::ConnectOptions::connect(&options).await {
+                            // Cleanup never runs with a superuser's rights.
+                            if !crate::store::session_is_superuser(&mut admin).await {
+                                let statement = format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
+                                let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+                                    .execute(&mut admin)
+                                    .await;
+                            }
+                            let _ = sqlx::Connection::close(admin).await;
                         }
                     })
                     .await;
@@ -672,6 +820,103 @@ impl Drop for FixtureFiles {
             let _ = std::fs::remove_dir_all(root);
         });
         let _ = cleanup.join();
+    }
+}
+
+/// A disposable schema that the migration owner created and has not yet migrated, with its
+/// fixture files and one pool for each credential. Dropping it drops the schema and the files.
+#[cfg(feature = "test-support")]
+pub struct DatabaseFixture {
+    fixture: FixtureFiles,
+    owner: sqlx::PgPool,
+    runtime: sqlx::PgPool,
+}
+
+#[cfg(feature = "test-support")]
+impl DatabaseFixture {
+    /// Writes fixture files from the process environment, opens both pools, refusing a
+    /// superuser on either, and creates the schema as the owner.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Initialization`] naming the step, or the missing or refused key.
+    pub async fn new() -> Result<Self, ServiceError> {
+        Self::create(FixtureFiles::write()?).await
+    }
+
+    async fn create(fixture: FixtureFiles) -> Result<Self, ServiceError> {
+        let owner = fixture.owner_pool().await?;
+        let runtime = fixture.runtime_pool().await?;
+        fixture.create_schema(&owner).await?;
+        Ok(Self {
+            fixture,
+            owner,
+            runtime,
+        })
+    }
+
+    /// Applies every embedded migration as the owner.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Initialization`] when a migration fails.
+    pub async fn migrate(&self) -> Result<(), ServiceError> {
+        self.fixture.migrate(&self.owner).await
+    }
+
+    /// The `DOCCHAIN_` environment that runs the server binary against this schema, document
+    /// root, and key files. It holds the runtime credential and no migration owner key.
+    pub fn server_environment(&self) -> Vec<(String, String)> {
+        self.fixture.environment.clone()
+    }
+
+    /// The `DOCCHAIN_` environment that runs `docchain-migrate` against this schema. It holds
+    /// the owner credential and not the runtime password.
+    pub fn migration_environment(&self) -> Vec<(String, String)> {
+        self.fixture.migration_environment.clone()
+    }
+
+    /// The migration owner's pool, for inspection and tampering.
+    pub const fn owner_pool(&self) -> &sqlx::PgPool {
+        &self.owner
+    }
+
+    /// The runtime role's pool, confined to this schema.
+    pub const fn runtime_pool(&self) -> &sqlx::PgPool {
+        &self.runtime
+    }
+
+    /// This fixture's schema.
+    pub fn schema(&self) -> &str {
+        &self.fixture.schema
+    }
+
+    /// The runtime role's name.
+    pub fn runtime_role(&self) -> &str {
+        &self.fixture.settings.database.user
+    }
+
+    /// The classes of the runtime privilege rule that the runtime role breaks, as the server
+    /// checks them at startup, from a runtime connection.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Inspection`] when the catalogs cannot be read.
+    pub async fn runtime_privilege_violations(&self) -> Result<Vec<String>, ServiceError> {
+        let mut conn = self
+            .runtime
+            .acquire()
+            .await
+            .map_err(|_| ServiceError::Inspection)?;
+        runtime_privilege_violations(&mut conn, self.runtime_role())
+            .await
+            .map(|violations| {
+                violations
+                    .iter()
+                    .map(|violation| format!("{violation:?}"))
+                    .collect()
+            })
+            .map_err(|_| ServiceError::Inspection)
     }
 }
 
@@ -690,15 +935,19 @@ impl DemoHarness {
     /// `2099-01-01T00:00:00Z`.
     pub async fn with_scheduled_revocation() -> Result<Self, ServiceError> {
         Self::compose_fixture(
-            FixtureFiles::write_with(Some("2099-01-01T00:00:00Z"))?,
+            FixtureFiles::write_with(process_environment(), Some("2099-01-01T00:00:00Z"))?,
             Limits::default(),
         )
         .await
     }
 
+    /// Creates and migrates the schema as the owner, then composes the service as the runtime
+    /// role, with every startup check.
     async fn compose_fixture(fixture: FixtureFiles, limits: Limits) -> Result<Self, ServiceError> {
-        fixture.create_schema().await?;
-        let service = DocchainService::compose_with_limits(&fixture.settings, limits).await?;
+        let database = DatabaseFixture::create(fixture).await?;
+        database.migrate().await?;
+        let service =
+            DocchainService::compose_with_limits(&database.fixture.settings, limits).await?;
         let [
             sender_credential,
             recipient_credential,
@@ -706,10 +955,10 @@ impl DemoHarness {
             unkeyed_credential,
             auditor_credential,
             operator_credential,
-        ] = fixture.credentials.clone();
+        ] = database.fixture.credentials.clone();
         Ok(Self {
             service: Arc::new(service),
-            fixture,
+            database,
             sender_credential,
             recipient_credential,
             unrelated_credential,
@@ -720,14 +969,32 @@ impl DemoHarness {
     }
 
     /// The `DOCCHAIN_` environment that runs the server binary against this harness's own
-    /// schema, document root, and key files.
+    /// schema, document root, and key files. It holds no migration owner key.
     pub fn server_environment(&self) -> Vec<(String, String)> {
-        self.fixture.environment.clone()
+        self.database.server_environment()
+    }
+
+    /// This harness's migrated schema, with the owner and runtime pools.
+    pub const fn database(&self) -> &DatabaseFixture {
+        &self.database
+    }
+
+    /// The migration owner's pool, which test inspection and tampering use.
+    pub const fn owner_pool(&self) -> &sqlx::PgPool {
+        &self.database.owner
+    }
+
+    /// The runtime role's pool.
+    pub const fn runtime_pool(&self) -> &sqlx::PgPool {
+        &self.database.runtime
     }
 
     /// This harness's schema name and fixture root, for cleanup checks.
     pub fn fixture_location(&self) -> (String, std::path::PathBuf) {
-        (self.fixture.schema.clone(), self.fixture.root.clone())
+        (
+            self.database.fixture.schema.clone(),
+            self.database.fixture.root.clone(),
+        )
     }
 
     pub fn service(&self) -> Arc<DocchainService> {
@@ -776,7 +1043,7 @@ impl DemoHarness {
     }
     /// The fixture-owned trust anchor supplied independently of any HTTP response.
     pub fn expected_audit_fingerprint(&self) -> [u8; 32] {
-        self.fixture.expected_audit_fingerprint
+        self.database.fixture.expected_audit_fingerprint
     }
     pub async fn audit_public_key(&self) -> Result<AuditPublicKey, ServiceError> {
         let actor = self.actor(&self.auditor_credential).await?;
@@ -790,7 +1057,7 @@ impl DemoHarness {
         self.service.export_audit_events(&actor, request).await
     }
     pub async fn stats(&self) -> Result<StateStats, ServiceError> {
-        let pool = self.service.pool();
+        let pool = &self.database.owner;
         let delivered = sqlx::query_scalar("SELECT COUNT(*) FROM exchanges")
             .fetch_one(pool)
             .await
@@ -807,7 +1074,7 @@ impl DemoHarness {
             .fetch_one(pool)
             .await
             .map_err(|_| ServiceError::Inspection)?;
-        let mut directory = tokio::fs::read_dir(&self.fixture.object_root)
+        let mut directory = tokio::fs::read_dir(&self.database.fixture.object_root)
             .await
             .map_err(|_| ServiceError::Inspection)?;
         let mut objects = 0_usize;
@@ -831,20 +1098,20 @@ impl DemoHarness {
         let object: String =
             sqlx::query_scalar("SELECT object_id FROM exchanges WHERE exchange_id = $1")
                 .bind(exchange.as_str())
-                .fetch_one(self.service.pool())
+                .fetch_one(&self.database.owner)
                 .await
                 .map_err(|_| ServiceError::Inspection)?;
-        tokio::fs::read(self.fixture.object_root.join(object))
+        tokio::fs::read(self.database.fixture.object_root.join(object))
             .await
             .map_err(|_| ServiceError::Inspection)
     }
     pub async fn object_exists(&self, object: &docchain_domain::ObjectId) -> bool {
-        tokio::fs::metadata(self.fixture.object_root.join(object.as_str()))
+        tokio::fs::metadata(self.database.fixture.object_root.join(object.as_str()))
             .await
             .is_ok()
     }
     pub async fn remove_document_root(&self) -> Result<(), ServiceError> {
-        tokio::fs::remove_dir_all(&self.fixture.object_root)
+        tokio::fs::remove_dir_all(&self.database.fixture.object_root)
             .await
             .map_err(|_| ServiceError::Inspection)
     }
@@ -895,10 +1162,10 @@ impl DemoHarness {
         let object: String =
             sqlx::query_scalar("SELECT object_id FROM exchanges WHERE exchange_id = $1")
                 .bind(exchange.as_str())
-                .fetch_one(self.service.pool())
+                .fetch_one(&self.database.owner)
                 .await
                 .map_err(|_| ServiceError::Inspection)?;
-        let path = self.fixture.object_root.join(object);
+        let path = self.database.fixture.object_root.join(object);
         let mut bytes = tokio::fs::read(&path)
             .await
             .map_err(|_| ServiceError::Inspection)?;
@@ -920,8 +1187,8 @@ impl DemoHarness {
     /// `audit_events` are disabled only inside this transaction, and re-enabled before it commits.
     pub async fn tamper_as_owner(&self, statement: &str) -> Result<u64, ServiceError> {
         let mut transaction = self
-            .service
-            .pool()
+            .database
+            .owner
             .begin()
             .await
             .map_err(|_| ServiceError::Inspection)?;
@@ -958,13 +1225,14 @@ impl DemoHarness {
             .map_err(|_| ServiceError::Inspection)?;
         Ok(affected)
     }
-    /// Runs one statement in its own transaction, optionally with
-    /// `session_replication_role = replica`, and returns the rows it affected or the SQLSTATE it
-    /// failed with.
+    /// Runs one statement as the migration owner in its own transaction, optionally after
+    /// `SET LOCAL session_replication_role = replica`, and returns the rows it affected or the
+    /// SQLSTATE the statement, the replica setting, or COMMIT failed with. The owner is not a
+    /// superuser, so the replica setting itself is refused.
     pub async fn sqlstate_of(&self, statement: &str, replica: bool) -> Result<u64, String> {
         let mut transaction = self
-            .service
-            .pool()
+            .database
+            .owner
             .begin()
             .await
             .map_err(|_| "connection".to_owned())?;
@@ -972,7 +1240,7 @@ impl DemoHarness {
             sqlx::raw_sql("SET LOCAL session_replication_role = replica")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|_| "replica role".to_owned())?;
+                .map_err(|error| sqlstate(&error))?;
         }
         let result = sqlx::raw_sql(sqlx::AssertSqlSafe(statement.to_owned()))
             .execute(&mut *transaction)
@@ -1006,7 +1274,7 @@ impl DemoHarness {
         if !APPEND_ONLY.contains(&table) {
             return Err("not an append-only table".to_owned());
         }
-        let pool = self.service.pool();
+        let pool = &self.database.owner;
         let mut transaction = pool.begin().await.map_err(|error| sqlstate(&error))?;
         let disabled = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} DISABLE TRIGGER {table}_refuse_update_delete"
@@ -1040,11 +1308,43 @@ impl DemoHarness {
         .map_err(|error| sqlstate(&error))?;
         outcome
     }
-    /// Runs one statement directly against this harness's schema, bypassing every use case, so
-    /// tests can tamper with stored rows the way a table writer could.
+    /// Runs statements as the runtime role in one transaction and returns the rows the last
+    /// affected, or the SQLSTATE a statement or COMMIT failed with. Without `commit` the
+    /// transaction always rolls back, so nothing the runtime role creates outlives it.
+    pub async fn sqlstate_as_runtime(&self, statements: &str, commit: bool) -> Result<u64, String> {
+        let mut transaction = self
+            .database
+            .runtime
+            .begin()
+            .await
+            .map_err(|error| sqlstate(&error))?;
+        let executed = sqlx::raw_sql(sqlx::AssertSqlSafe(statements.to_owned()))
+            .execute(&mut *transaction)
+            .await;
+        match executed {
+            Ok(done) if commit => transaction
+                .commit()
+                .await
+                .map(|()| done.rows_affected())
+                .map_err(|error| sqlstate(&error)),
+            Ok(done) => {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|error| sqlstate(&error))?;
+                Ok(done.rows_affected())
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(sqlstate(&error))
+            }
+        }
+    }
+    /// Runs one statement as the migration owner, bypassing every use case, so tests can
+    /// inspect or tamper with stored rows the way the table owner could.
     pub async fn execute_unchecked(&self, statement: &str) -> Result<u64, ServiceError> {
         sqlx::raw_sql(sqlx::AssertSqlSafe(statement.to_owned()))
-            .execute(self.service.pool())
+            .execute(&self.database.owner)
             .await
             .map(|done| done.rows_affected())
             .map_err(|_| ServiceError::Inspection)
@@ -1067,30 +1367,104 @@ fn write(path: &std::path::Path, value: &str) -> Result<(), ServiceError> {
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
     async fn exists(options: PgConnectOptions, schema: &str) -> Option<bool> {
-        schema_exists(options, schema).await.ok()
+        schema_exists_as(options, schema).await.ok()
     }
 
     #[tokio::test]
     async fn composition_rejects_a_mismatched_audit_public_key_pin() {
         let mut fixture = FixtureFiles::write().expect("fixture");
-        fixture.create_schema().await.expect("schema");
         fixture.settings.keys.audit_public_key_fingerprint = [0; 32];
+        let database = DatabaseFixture::create(fixture).await.expect("schema");
+        database.migrate().await.expect("migrations");
         assert!(matches!(
-            DocchainService::compose(&fixture.settings).await,
+            DocchainService::compose(&database.fixture.settings).await,
             Err(ServiceError::Initialization("audit public key fingerprint"))
         ));
+    }
+
+    #[test]
+    fn server_environments_never_carry_migration_owner_keys() {
+        let secrets = std::env::temp_dir().join(format!(
+            "docchain_harness_environment_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&secrets).expect("secret directory");
+        let runtime_file = secrets.join("runtime");
+        let owner_file = secrets.join("owner");
+        std::fs::write(&runtime_file, "invented-runtime-password").expect("runtime file");
+        std::fs::write(&owner_file, "invented-owner-password").expect("owner file");
+        let base: HashMap<String, String> = [
+            ("DOCCHAIN_DATABASE__USER", "docchain_runtime".to_owned()),
+            (
+                "DOCCHAIN_DATABASE__PASSWORD_FILE",
+                runtime_file.display().to_string(),
+            ),
+            ("DOCCHAIN_MIGRATION__USER", "docchain_owner".to_owned()),
+            (
+                "DOCCHAIN_MIGRATION__PASSWORD_FILE",
+                owner_file.display().to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect();
+
+        let fixture = FixtureFiles::write_with(base.clone(), None).expect("fixture");
+        // The in-process settings refuse any owner key, so building them proves its absence.
+        assert!(
+            fixture
+                .environment
+                .iter()
+                .all(|(key, _)| !key.starts_with("DOCCHAIN_MIGRATION__"))
+        );
+        assert_eq!(fixture.settings.database.user, "docchain_runtime");
+        assert_eq!(fixture.owner.owner, "docchain_owner");
+        assert_eq!(fixture.owner.runtime_role, "docchain_runtime");
+        assert!(
+            fixture
+                .migration_environment
+                .iter()
+                .all(|(key, _)| !key.starts_with("DOCCHAIN_DATABASE__PASSWORD"))
+        );
+        assert!(
+            fixture
+                .migration_environment
+                .iter()
+                .any(|(key, _)| key == "DOCCHAIN_MIGRATION__PASSWORD_FILE")
+        );
+        drop(fixture);
+
+        // Each missing credential key fails the fixture, naming the key.
+        for key in [
+            "DOCCHAIN_DATABASE__USER",
+            "DOCCHAIN_DATABASE__PASSWORD_FILE",
+            "DOCCHAIN_MIGRATION__USER",
+            "DOCCHAIN_MIGRATION__PASSWORD_FILE",
+        ] {
+            let mut incomplete = base.clone();
+            incomplete.remove(key);
+            match FixtureFiles::write_with(incomplete, None) {
+                Err(ServiceError::Initialization(step)) => assert!(step.ends_with(key), "{key}"),
+                Err(other) => panic!("{key}: {other:?}"),
+                Ok(_) => panic!("{key}: fixture without the key"),
+            }
+        }
+        std::fs::remove_dir_all(secrets).expect("remove secrets");
     }
 
     #[tokio::test]
     async fn dropping_a_harness_removes_its_schema_and_root() {
         let harness = DemoHarness::new().await.expect("harness");
         let (schema, root) = harness.fixture_location();
-        let admin = harness.fixture.admin_options();
+        let admin = harness.database.fixture.owner_options();
         assert_eq!(exists(admin.clone(), &schema).await, Some(true));
         assert!(root.exists());
         let started = Instant::now();
@@ -1103,7 +1477,10 @@ mod tests {
         let (location_tx, location_rx) = tokio::sync::oneshot::channel();
         let panicked = tokio::spawn(async move {
             let harness = DemoHarness::new().await.expect("harness");
-            let _ = location_tx.send((harness.fixture_location(), harness.fixture.admin_options()));
+            let _ = location_tx.send((
+                harness.fixture_location(),
+                harness.database.fixture.owner_options(),
+            ));
             panic!("a failing test");
         })
         .await;

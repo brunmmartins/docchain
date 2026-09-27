@@ -1,8 +1,9 @@
 use std::fmt;
 
 use docchain_domain::{
-    AuditChallenge, AuditEvent, AuditExportManifest, Checkpoint, DocumentId, DocumentVersion,
-    DomainError, ExchangeId, IdempotencyKey, ObjectId, RequestNonce, WalletId, sha256,
+    AuditChallenge, AuditEvent, AuditExportManifest, Checkpoint, CreditMismatch,
+    CreditReconciliation, DocumentId, DocumentVersion, DomainError, ExchangeId, IdempotencyKey,
+    ObjectId, RequestNonce, WalletId, sha256,
 };
 use thiserror::Error;
 
@@ -140,6 +141,8 @@ pub struct AuditReport {
     pub event_count: usize,
     /// The verified head, which the auditor keeps to detect later truncation.
     pub head: Option<Checkpoint>,
+    /// The credit ledger reconciled with the verified acceptances.
+    pub credits: CreditReconciliation,
 }
 
 /// A separately provisioned SHA-256 fingerprint of the expected audit public key.
@@ -473,6 +476,9 @@ pub enum ApplicationError {
     /// The event chain or a ciphertext commitment failed verification.
     #[error("integrity failure")]
     IntegrityFailure,
+    /// Audit verification failed, for the stated class of check only.
+    #[error("integrity failure")]
+    AuditMismatch(AuditMismatch),
     /// More events exist than the bounded audit can verify.
     #[error("audit incomplete")]
     AuditIncomplete,
@@ -482,6 +488,51 @@ pub enum ApplicationError {
     /// Stored state broke an invariant.
     #[error("application invariant failed")]
     Invariant,
+}
+
+/// The class of check that failed audit verification. Checks run in the order chain,
+/// envelopes, credits, and the first failure answers. No class carries an identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditMismatch {
+    /// A hash, link, signature, count, page, held-checkpoint, or snapshot check failed, or an
+    /// exchange was accepted twice.
+    EventChain,
+    /// A stored envelope is missing, or its commitment or header does not match its event.
+    EnvelopeCommitment,
+    /// A credit transaction or entry refers to no verified accepted exchange.
+    CreditUnaccepted,
+    /// An accepted exchange has more than one credit transaction.
+    CreditDuplicate,
+    /// An accepted exchange's credit transaction has the wrong key or entries.
+    CreditUnbalanced,
+    /// An accepted exchange has no credit transaction.
+    CreditMissing,
+}
+
+impl AuditMismatch {
+    /// The stable reason code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EventChain => "event-chain",
+            Self::EnvelopeCommitment => "envelope-commitment",
+            Self::CreditUnaccepted => "credit-unaccepted",
+            Self::CreditDuplicate => "credit-duplicate",
+            Self::CreditUnbalanced => "credit-unbalanced",
+            Self::CreditMissing => "credit-missing",
+        }
+    }
+}
+
+impl From<CreditMismatch> for AuditMismatch {
+    fn from(mismatch: CreditMismatch) -> Self {
+        match mismatch {
+            CreditMismatch::Unaccepted => Self::CreditUnaccepted,
+            CreditMismatch::Duplicate => Self::CreditDuplicate,
+            CreditMismatch::Unbalanced => Self::CreditUnbalanced,
+            CreditMismatch::Missing => Self::CreditMissing,
+        }
+    }
 }
 
 impl From<DomainError> for ApplicationError {

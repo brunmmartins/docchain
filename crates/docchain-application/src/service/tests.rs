@@ -15,16 +15,17 @@ use std::{
 };
 
 use docchain_domain::{
-    AuditChallenge, AuditEvent, AuditExportManifest, AuditSnapshot, DocumentId, DocumentVersion,
-    EventDraft, ExchangeId, RequestNonce, Timestamp, event_signature_input, parse_document,
+    AuditChallenge, AuditEvent, AuditExportManifest, AuditSnapshot, CreditLedgerEntry,
+    CreditLedgerTransaction, DocumentId, DocumentVersion, EventDraft, ExchangeId, ISSUANCE_ACCOUNT,
+    RequestNonce, Timestamp, event_signature_input, parse_document,
 };
 
 use super::*;
 use crate::AuditKeyPin;
 use crate::ports::{
-    AuditEventStore, AuditReadError, AuditReadRequest, AuditStoredPage, Clock, DocumentStore,
-    EnvelopeCryptography, EnvelopeHeader, EventIntegrity, ExchangeStore, Identity, IntegrityError,
-    KeyRegistry, SchemaArtifact, SchemaRegistry, SealedEnvelope,
+    AuditCreditSnapshot, AuditEventStore, AuditReadError, AuditReadRequest, AuditStoredPage, Clock,
+    DocumentStore, EnvelopeCryptography, EnvelopeHeader, EventIntegrity, ExchangeStore, Identity,
+    IntegrityError, KeyRegistry, SchemaArtifact, SchemaRegistry, SealedEnvelope,
 };
 
 const SCHEMA_ID: &str = "urn:docchain:schema:service-application:1.0.0";
@@ -85,6 +86,14 @@ struct Fake {
     signatures: AtomicUsize,
     /// How many upcoming replay lookups see the store as it was before a concurrent commit.
     stale_reads: AtomicUsize,
+    /// The ledger the credit snapshot returns instead of one derived from the postings.
+    ledger: Mutex<Option<Vec<CreditLedgerTransaction>>>,
+    /// A failure the next credit snapshot returns.
+    credit_snapshot_error: Mutex<Option<AuditReadError>>,
+    /// The snapshot every audit page read was asked to continue, in order.
+    page_snapshots: Mutex<Vec<Option<AuditSnapshot>>>,
+    /// Audit-store calls of either operation.
+    audit_reads: AtomicUsize,
 }
 
 impl Fake {
@@ -140,6 +149,10 @@ impl Fake {
             postings: Mutex::new(Vec::new()),
             signatures: AtomicUsize::new(0),
             stale_reads: AtomicUsize::new(0),
+            ledger: Mutex::new(None),
+            credit_snapshot_error: Mutex::new(None),
+            page_snapshots: Mutex::new(Vec::new()),
+            audit_reads: AtomicUsize::new(0),
         }
     }
 
@@ -563,7 +576,69 @@ impl ExchangeStore for Fake {
 }
 
 impl AuditEventStore for Fake {
+    async fn credit_snapshot(
+        &self,
+        max_transactions: u32,
+    ) -> Result<AuditCreditSnapshot, AuditReadError> {
+        self.audit_reads.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self
+            .credit_snapshot_error
+            .lock()
+            .expect("credit snapshot error")
+            .take()
+        {
+            return Err(error);
+        }
+        let events = self.events.lock().expect("events");
+        let snapshot = AuditSnapshot::new(
+            u64::try_from(events.len()).map_err(|_| AuditReadError::Invariant)?,
+            events.last().map(AuditEvent::checkpoint),
+        )
+        .map_err(|_| AuditReadError::Invariant)?;
+        let transactions = self
+            .ledger
+            .lock()
+            .expect("ledger")
+            .clone()
+            .unwrap_or_else(|| {
+                self.postings
+                    .lock()
+                    .expect("postings")
+                    .iter()
+                    .map(|posting| CreditLedgerTransaction {
+                        eligibility_key: posting.eligibility_key.clone(),
+                        exchange_id: posting
+                            .eligibility_key
+                            .strip_prefix("acceptance:")
+                            .map(str::to_owned),
+                        entries: vec![
+                            CreditLedgerEntry {
+                                account: ISSUANCE_ACCOUNT.to_owned(),
+                                amount: -posting.amount,
+                            },
+                            CreditLedgerEntry {
+                                account: posting.wallet.as_str().to_owned(),
+                                amount: posting.amount,
+                            },
+                        ],
+                    })
+                    .collect()
+            });
+        if transactions.len() > usize::try_from(max_transactions).unwrap_or(usize::MAX) {
+            return Err(AuditReadError::Exhausted);
+        }
+        Ok(AuditCreditSnapshot {
+            snapshot,
+            transactions,
+        })
+    }
+
     async fn page(&self, request: AuditReadRequest) -> Result<AuditStoredPage, AuditReadError> {
+        self.audit_reads.fetch_add(1, Ordering::SeqCst);
+        self.page_snapshots
+            .lock()
+            .expect("page snapshots")
+            .push(request.snapshot);
         let events = self.events.lock().expect("events");
         let selected = AuditSnapshot::new(
             u64::try_from(events.len()).map_err(|_| AuditReadError::Invariant)?,
@@ -1185,17 +1260,26 @@ fn audit_verifies_events_and_ciphertext_for_auditors_only() {
         &key("idem_accept0000000001"),
     ))
     .expect("acceptance");
+    let fake_state = fake(&application);
     for caller in [actor(SENDER), actor(RECIPIENT), Actor::Operator] {
         assert_eq!(
             block_on(application.verify_audit(&caller, None)),
             Err(ApplicationError::Forbidden)
         );
     }
+    // A refused caller causes no audit-store read at all.
+    assert_eq!(fake_state.audit_reads.load(Ordering::SeqCst), 0);
     let report = block_on(application.verify_audit(&Actor::Auditor, None)).expect("verified");
     assert_eq!(report.event_count, 2);
+    assert_eq!(
+        (
+            report.credits.accepted_exchanges(),
+            report.credits.credit_transactions()
+        ),
+        (1, 1)
+    );
     let head = report.head.expect("head");
 
-    let fake_state = fake(&application);
     let removed = fake_state
         .events
         .lock()
@@ -1204,7 +1288,7 @@ fn audit_verifies_events_and_ciphertext_for_auditors_only() {
         .expect("event");
     assert_eq!(
         block_on(application.verify_audit(&Actor::Auditor, Some(head))),
-        Err(ApplicationError::IntegrityFailure)
+        Err(ApplicationError::AuditMismatch(AuditMismatch::EventChain))
     );
     fake_state.events.lock().expect("events").push(removed);
     assert!(block_on(application.verify_audit(&Actor::Auditor, Some(head))).is_ok());
@@ -1216,8 +1300,232 @@ fn audit_verifies_events_and_ciphertext_for_auditors_only() {
         .insert(delivery.object_id, b"substituted".to_vec());
     assert_eq!(
         block_on(application.verify_audit(&Actor::Auditor, None)),
-        Err(ApplicationError::IntegrityFailure)
+        Err(ApplicationError::AuditMismatch(
+            AuditMismatch::EnvelopeCommitment
+        ))
     );
+}
+
+#[test]
+fn audit_pages_continue_the_credit_snapshot_from_the_start() {
+    let application = application_with(Limits {
+        audit_events: 2_000,
+        ..Limits::default()
+    });
+    let fake_state = fake(&application);
+    block_on(application.send_copy(&actor(SENDER), command())).expect("delivery");
+    let record = fake_state.exchanges.lock().expect("exchanges")[0].clone();
+    // Enough events for three pages of 500.
+    for _ in 0..1_000 {
+        fake_state
+            .append(draft(&record, EventKind::Delivered), fake_state)
+            .expect("event");
+    }
+    let report = block_on(application.verify_audit(&Actor::Auditor, None)).expect("verified");
+    assert_eq!(report.event_count, 1_001);
+    let tail = fake_state
+        .events
+        .lock()
+        .expect("events")
+        .last()
+        .map(AuditEvent::checkpoint);
+    let pages = fake_state.page_snapshots.lock().expect("pages").clone();
+    assert_eq!(pages.len(), 3);
+    assert!(pages.iter().all(|page| {
+        page.is_some_and(|snapshot| snapshot.head() == tail && snapshot.event_count() == 1_001)
+    }));
+}
+
+#[test]
+fn audit_ledger_beyond_the_bound_is_incomplete() {
+    let application = application();
+    let fake_state = fake(&application);
+    *fake_state
+        .credit_snapshot_error
+        .lock()
+        .expect("credit snapshot error") = Some(AuditReadError::Exhausted);
+    assert_eq!(
+        block_on(application.verify_audit(&Actor::Auditor, None)),
+        Err(ApplicationError::AuditIncomplete)
+    );
+    // The fake store applies the bound it is given, which is the verify event limit.
+    let application = application_with(Limits {
+        audit_events: 1,
+        ..Limits::default()
+    });
+    let fake_state = fake(&application);
+    let posting = |index: u8| CreditLedgerTransaction {
+        eligibility_key: format!("acceptance:{index}"),
+        exchange_id: None,
+        entries: Vec::new(),
+    };
+    *fake_state.ledger.lock().expect("ledger") = Some(vec![posting(1), posting(2)]);
+    assert_eq!(
+        block_on(application.verify_audit(&Actor::Auditor, None)),
+        Err(ApplicationError::AuditIncomplete)
+    );
+    for (error, expected) in [
+        (
+            AuditReadError::SnapshotChanged,
+            ApplicationError::AuditMismatch(AuditMismatch::EventChain),
+        ),
+        (
+            AuditReadError::Invariant,
+            ApplicationError::AuditMismatch(AuditMismatch::EventChain),
+        ),
+        (AuditReadError::Transient, ApplicationError::Unavailable),
+        (AuditReadError::Permanent, ApplicationError::Unavailable),
+    ] {
+        *fake_state
+            .credit_snapshot_error
+            .lock()
+            .expect("credit snapshot error") = Some(error);
+        assert_eq!(
+            block_on(application.verify_audit(&Actor::Auditor, None)),
+            Err(expected),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn chain_and_envelope_failures_answer_before_credit_reconciliation() {
+    let application = application();
+    let fake_state = fake(&application);
+    let delivery = block_on(application.send_copy(&actor(SENDER), command())).expect("delivery");
+    block_on(application.accept(
+        &actor(RECIPIENT),
+        &delivery.exchange_id,
+        &key("idem_accept0000000001"),
+    ))
+    .expect("acceptance");
+    // The ledger is missing the credit throughout.
+    *fake_state.ledger.lock().expect("ledger") = Some(Vec::new());
+    assert_eq!(
+        block_on(application.verify_audit(&Actor::Auditor, None)),
+        Err(ApplicationError::AuditMismatch(
+            AuditMismatch::CreditMissing
+        ))
+    );
+
+    let original = fake_state.objects.lock().expect("objects")[&delivery.object_id].clone();
+    fake_state
+        .objects
+        .lock()
+        .expect("objects")
+        .insert(delivery.object_id.clone(), b"substituted".to_vec());
+    assert_eq!(
+        block_on(application.verify_audit(&Actor::Auditor, None)),
+        Err(ApplicationError::AuditMismatch(
+            AuditMismatch::EnvelopeCommitment
+        ))
+    );
+    fake_state
+        .objects
+        .lock()
+        .expect("objects")
+        .remove(&delivery.object_id);
+    assert_eq!(
+        block_on(application.verify_audit(&Actor::Auditor, None)),
+        Err(ApplicationError::AuditMismatch(
+            AuditMismatch::EnvelopeCommitment
+        ))
+    );
+
+    fake_state.events.lock().expect("events")[0]
+        .draft
+        .registry_sequence += 1;
+    assert_eq!(
+        block_on(application.verify_audit(&Actor::Auditor, None)),
+        Err(ApplicationError::AuditMismatch(AuditMismatch::EventChain))
+    );
+    fake_state.events.lock().expect("events")[0]
+        .draft
+        .registry_sequence -= 1;
+    fake_state
+        .objects
+        .lock()
+        .expect("objects")
+        .insert(delivery.object_id, original);
+    *fake_state.ledger.lock().expect("ledger") = None;
+    assert!(block_on(application.verify_audit(&Actor::Auditor, None)).is_ok());
+}
+
+#[test]
+fn a_repeated_signed_acceptance_is_an_event_chain_failure() {
+    let application = application();
+    let fake_state = fake(&application);
+    let delivery = block_on(application.send_copy(&actor(SENDER), command())).expect("delivery");
+    block_on(application.accept(
+        &actor(RECIPIENT),
+        &delivery.exchange_id,
+        &key("idem_accept0000000001"),
+    ))
+    .expect("acceptance");
+    let record = fake_state.exchanges.lock().expect("exchanges")[0].clone();
+    fake_state
+        .append(draft(&record, EventKind::Accepted), fake_state)
+        .expect("second signed acceptance");
+    assert_eq!(
+        block_on(application.verify_audit(&Actor::Auditor, None)),
+        Err(ApplicationError::AuditMismatch(AuditMismatch::EventChain))
+    );
+}
+
+#[test]
+fn each_credit_mismatch_reports_its_reason() {
+    let application = application();
+    let fake_state = fake(&application);
+    let delivery = block_on(application.send_copy(&actor(SENDER), command())).expect("delivery");
+    block_on(application.accept(
+        &actor(RECIPIENT),
+        &delivery.exchange_id,
+        &key("idem_accept0000000001"),
+    ))
+    .expect("acceptance");
+    let expected = CreditLedgerTransaction {
+        eligibility_key: format!("acceptance:{}", delivery.exchange_id),
+        exchange_id: Some(delivery.exchange_id.to_string()),
+        entries: vec![
+            CreditLedgerEntry {
+                account: ISSUANCE_ACCOUNT.to_owned(),
+                amount: -1,
+            },
+            CreditLedgerEntry {
+                account: SENDER.to_owned(),
+                amount: 1,
+            },
+        ],
+    };
+    let mut unaccepted = expected.clone();
+    unaccepted.exchange_id = Some("exc_00000000000000000000000000000009".to_owned());
+    let mut unbalanced = expected.clone();
+    unbalanced.entries[1].account = RECIPIENT.to_owned();
+    for (ledger, reason) in [
+        (vec![expected.clone()], None),
+        (
+            vec![expected.clone(), unaccepted],
+            Some(AuditMismatch::CreditUnaccepted),
+        ),
+        (
+            vec![expected.clone(), expected.clone()],
+            Some(AuditMismatch::CreditDuplicate),
+        ),
+        (vec![unbalanced], Some(AuditMismatch::CreditUnbalanced)),
+        (vec![], Some(AuditMismatch::CreditMissing)),
+    ] {
+        *fake_state.ledger.lock().expect("ledger") = Some(ledger);
+        let verified = block_on(application.verify_audit(&Actor::Auditor, None));
+        match reason {
+            None => assert!(verified.is_ok()),
+            Some(reason) => assert_eq!(
+                verified,
+                Err(ApplicationError::AuditMismatch(reason)),
+                "{}",
+                reason.as_str()
+            ),
+        }
+    }
 }
 
 #[test]

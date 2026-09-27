@@ -45,11 +45,13 @@ values are supplied as mounted files. The settings are:
 | `DOCCHAIN_DATABASE__HOST` | `postgres` |
 | `DOCCHAIN_DATABASE__PORT` | `5432` |
 | `DOCCHAIN_DATABASE__NAME` | `docchain` |
-| `DOCCHAIN_DATABASE__USER` | `docchain` |
-| `DOCCHAIN_DATABASE__PASSWORD` | Read from the password file when unset |
-| `DOCCHAIN_DATABASE__PASSWORD_FILE` | Required when `DOCCHAIN_DATABASE__PASSWORD` is unset |
+| `DOCCHAIN_DATABASE__USER` | `docchain`; the runtime role. `docchain-migrate` requires it explicitly, as a lower-case PostgreSQL identifier other than the owner |
+| `DOCCHAIN_DATABASE__PASSWORD` | Read from the password file when unset; the server only |
+| `DOCCHAIN_DATABASE__PASSWORD_FILE` | Required when `DOCCHAIN_DATABASE__PASSWORD` is unset; the server only |
 | `DOCCHAIN_DATABASE__MAX_CONNECTIONS` | `10` (accepted range 2 to 64) |
-| `DOCCHAIN_DATABASE__SCHEMA` | `public` (an existing schema; lower-case PostgreSQL identifier) |
+| `DOCCHAIN_DATABASE__SCHEMA` | Required, no default: an existing schema the migration owner owns, a lower-case PostgreSQL identifier, never `public` |
+| `DOCCHAIN_MIGRATION__USER` | Required by `docchain-migrate` only: the migration owner. The server refuses to start when any `DOCCHAIN_MIGRATION__` variable is set |
+| `DOCCHAIN_MIGRATION__PASSWORD` or `DOCCHAIN_MIGRATION__PASSWORD_FILE` | Required by `docchain-migrate` only, with the same rules as the runtime password |
 | `DOCCHAIN_HTTP__BIND` | `127.0.0.1:3000` |
 | `DOCCHAIN_HTTP__REQUEST_TIMEOUT_MS` | `5000` (accepted range 1 to 60000) |
 | `DOCCHAIN_HTTP__MAX_IN_FLIGHT` | `64` (accepted range 1 to 1024) |
@@ -74,16 +76,20 @@ never commit it. Then run:
 just demo-first-slice
 ```
 
-To run the HTTP service after supplying every required path above, use `cargo run -p docchain-server`.
-It applies its embedded migrations before accepting requests. Standard input is ignored. SIGINT or
+To run the HTTP service, first bring the schema up to date with `just migrate` (see
+[Database roles](#database-roles)), then, after supplying every required path above, use
+`cargo run -p docchain-server`. The server never applies migrations. Before it listens, it checks, in
+order, that the schema exists, that every embedded migration is applied unchanged, that the
+connection's schema is `DOCCHAIN_DATABASE__SCHEMA`, and that its role holds exactly the runtime
+privileges below; otherwise it exits nonzero with one of `database schema`,
+`database migrations pending`, `database migrations mismatch`, or `database role privileges`, and
+never names a user, password, path, or which privilege failed. Standard input is ignored. SIGINT or
 SIGTERM stops intake and drains admitted requests; a complete drain exits zero, while exceeding the
 configured shutdown deadline cancels the remaining requests, which receive `503` with the category
 `dependency-failure` if their connection is still open, and exits nonzero. A cancelled send retried
-with the same idempotency key returns the prior result if it had committed. Startup fails before
-migrating when the connection's current schema is not `DOCCHAIN_DATABASE__SCHEMA`. Each exchange
-records when its send checked its keys; a schema that already holds exchanges or events stored
-without that time is refused by the migration, and startup stops, because no true value exists for
-them.
+with the same idempotency key returns the prior result if it had committed. Each exchange records
+when its send checked its keys; a schema that already holds exchanges or events stored without that
+time is refused by the migration, because no true value exists for them.
 
 `GET /health/live` answers `204` while the process runs. `GET /health/ready` answers `204` only when
 PostgreSQL responds and the document-store root was proven writable within the last second, and
@@ -96,18 +102,109 @@ credential file; no other header selects a wallet or role.
 `GET /v1/audit/verify` returns the server-verified signed chain head. An auditor who presents a head
 it verified earlier, as `head_sequence`, `head_event_hash`, and `head_signature` query parameters,
 is told when events after it have gone. A first call establishes a baseline only, because the
-service that answers holds the audit key. A chain longer than 100,000 events returns `503` with the
-category `audit-incomplete` rather than a verdict for part of it. Accepting an exchange returns only
+service that answers holds the audit key. The chain tail and the whole credit ledger are read in one
+snapshot, and a successful body carries `credits`: `{"reconciled": true, "accepted_exchanges": N,
+"credit_transactions": N}`, stating that every accepted exchange has exactly one balanced credit
+transaction and every credit transaction belongs to exactly one accepted exchange. A failure is
+`409` with exactly `{"category": "integrity-failure", "reason": <code>}`, where the code names the
+first failing class, checked in this order: `event-chain`, `envelope-commitment`,
+`credit-unaccepted`, `credit-duplicate`, `credit-unbalanced`, `credit-missing`. Neither response
+carries an exchange, wallet, key, or amount per wallet. A chain longer than 100,000 events, or a
+ledger longer than 100,000 transactions or 200,000 entries, returns `503` with the category
+`audit-incomplete` rather than a verdict for part of it. Accepting an exchange returns only
 that exchange's ID and `credit_awarded: 1`. Reading a document checks the sender's and reader's keys
 as they stood when the copy was sent, so a key revocation that takes effect later leaves earlier
 copies readable.
 
 The command reproduces the byte-exact version 1 envelope vector, then runs the system tests one at a
 time. Together they cover delivery, acceptance, replay protection, schema rejection, privacy,
-integrity, and independent audit. Each test creates its own database schema and temporary
-document-store root under `TMPDIR`, reads the database coordinates from the `DOCCHAIN_DATABASE__*`
-variables or, failing those, from `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD_FILE`, and
-never starts, stops, resets, or deletes the PostgreSQL service.
+integrity, independent audit, and the database role checks. Each test creates its own database
+schema and temporary document-store root under `TMPDIR`. It reads the runtime role's credential from
+the `DOCCHAIN_DATABASE__*` variables and the migration owner's from the `DOCCHAIN_MIGRATION__*`
+variables that the recipe sets; a missing variable fails the test and names it. The owner creates,
+migrates, inspects, and drops each schema, and the service under test uses only the runtime role.
+Tests refuse a superuser for either role, never create or alter roles, and never start, stop,
+reset, or delete the PostgreSQL service.
+
+### Database roles
+
+Docchain uses two PostgreSQL roles, which the platform provisions:
+
+- The **migration owner** (`docchain_owner` by default) owns the configured schema and every object
+  in it. Only `docchain-migrate` connects as it. It must not be a superuser: `docchain-migrate` and
+  the tests refuse a superuser session. For the tests' disposable schemas it needs CREATE on the
+  database; it does not need CREATEROLE.
+- The **runtime role** (`docchain_runtime` by default) is the only role the server uses. It has LOGIN
+  and CONNECT, no superuser, CREATEROLE, CREATEDB, REPLICATION, or BYPASSRLS attribute, membership
+  in no role, ownership of nothing, no parameter privilege, no CREATE on the database, and no per-role
+  setting. The schema migrations grant it exactly: USAGE on the schema; SELECT on `exchanges`, INSERT
+  on every `exchanges` column except `accepted`, and UPDATE on `accepted` only; SELECT and INSERT on
+  `audit_events`, `credit_transactions`, and `credit_entries`; INSERT on `acceptances`; SELECT on
+  `_sqlx_migrations`; and nothing else, no sequence or function privilege and no grant option. It
+  therefore cannot drop, disable, or bypass a trigger, alter, truncate, or rewrite a table, record a
+  migration, or switch roles. An accepted exchange cannot be reset, and every trigger fires in every
+  session replication role.
+
+**Process environments.** Each process holds one database credential. The shared environment of
+the container sets only the server's keys: `DOCCHAIN_DATABASE__USER` and
+`DOCCHAIN_DATABASE__PASSWORD_FILE` naming the runtime role and its file, and
+`DOCCHAIN_DATABASE__SCHEMA` naming the project's schema. No `DOCCHAIN_MIGRATION__` variable belongs
+there. `just migrate`, `just test`, and `just demo-first-slice` set the owner's keys on their own
+commands only, from the `justfile` variables `migration_owner` and
+`migration_owner_password_file`. Without `just`:
+
+```bash
+DOCCHAIN_MIGRATION__USER=docchain_owner \
+DOCCHAIN_MIGRATION__PASSWORD_FILE=/run/secrets/docchain_owner_key \
+    cargo run -p docchain-server --bin docchain-migrate
+```
+
+`docchain-migrate` takes no arguments and never reads standard input. It connects as the owner,
+refuses a superuser session (`database owner role`), requires the schema to exist
+(`database schema`), and applies every pending forward migration (`database migration`). It exits
+0 when the schema is current, 1 on a failure, and 2 when given any argument. The migration that
+grants the runtime role refuses to run unless the owner owns the schema and everything in it, the
+schema is not `public`, and the runtime role meets the rules above; a schema created and migrated by
+another role cannot be upgraded and is replaced by a fresh one, because its data is synthetic.
+
+**Platform requirements.** These are outside Docchain:
+
+- Create both roles without a `PASSWORD` clause, then set each password with psql's `\password`,
+  which sends only a verifier computed by the client. The server logs the text of a failing
+  statement, so a cleartext password must never appear in SQL. Supply each password as a mounted
+  file.
+- Once the roles and schema are provisioned, the application container holds no valid platform
+  superuser credential. In the provisioning session, the platform sets a new superuser password that
+  never enters the application container, ends every superuser session from the network, and removes
+  the old password file and every variable that names it or carries a superuser password. Removal
+  alone is not enough, because a copy read earlier survives it. No Docchain process needs the
+  superuser.
+- No database credential that has been readable in the local container is ever valid in any other
+  environment. Every other environment gets its own passwords, set there with client-computed
+  verifiers. In the local container the server's operating-system identity can also read the
+  owner's password file; that is accepted there only for a limited time, after which the platform
+  separates the owner file and sets a new owner password that identity has never been able to read.
+- Outside the local container, the identity that runs the server can read only the runtime role's
+  password file and the key and identity files the server's own settings name. The owner's password
+  file is mounted only for the migrator's run.
+- Revoking TEMPORARY on the database from PUBLIC is recommended but not required.
+
+**Recovery after a leaked runtime credential.** Its holder can leave an owned object, a per-role
+setting, or a changed password behind; the server then refuses to start (`database role
+privileges`) or cannot connect (`database connection`). Neither the server nor the owner can undo
+that; the platform, as the superuser, does:
+
+1. Set a new runtime password with psql's `\password`, and replace the runtime password file.
+2. End every remaining session of the runtime role.
+3. In each database where `pg_shdepend` records an object the runtime role owns, run
+   `REASSIGN OWNED BY <runtime role> TO <platform role>`. Never run `DROP OWNED BY` for the runtime
+   role: it also revokes the role's grants, which only the migrations give.
+4. Run `ALTER ROLE <runtime role> RESET ALL`, and the same with `IN DATABASE <database>` for each
+   database that has a setting for it.
+5. Start the server; its startup checks confirm the recovery.
+6. Run audit verification. If it fails, replace the synthetic schema.
+
+If the leak may have come from inside the container, change the owner password too.
 
 ### Independent audit
 

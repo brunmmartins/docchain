@@ -6,8 +6,8 @@
 use std::{fmt, future::Future};
 
 use docchain_domain::{
-    AuditEvent, AuditSnapshot, DocumentId, DocumentVersion, EventDraft, ExchangeId, IdempotencyKey,
-    ObjectId, RequestNonce, Timestamp, WalletId,
+    AuditEvent, AuditSnapshot, CreditLedgerTransaction, DocumentId, DocumentVersion, EventDraft,
+    ExchangeId, IdempotencyKey, ObjectId, RequestNonce, Timestamp, WalletId,
 };
 use thiserror::Error;
 
@@ -361,6 +361,24 @@ pub enum AuditReadError {
     /// Stored data broke an invariant.
     #[error("invariant")]
     Invariant,
+    /// More rows exist than the read's bound; no partial result is returned.
+    #[error("exhausted")]
+    Exhausted,
+}
+
+/// The chain tail and the whole credit ledger, read together in one snapshot transaction.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuditCreditSnapshot {
+    /// The chain tail at the moment the ledger was read.
+    pub snapshot: AuditSnapshot,
+    /// Every stored credit transaction, and entries without one, exactly as read.
+    pub transactions: Vec<CreditLedgerTransaction>,
+}
+
+impl fmt::Debug for AuditCreditSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuditCreditSnapshot(redacted)")
+    }
 }
 
 /// Reads signed events without exposing SQL or holding state across requests.
@@ -370,6 +388,25 @@ pub trait AuditEventStore: Send + Sync {
         &self,
         request: AuditReadRequest,
     ) -> impl Future<Output = Result<AuditStoredPage, AuditReadError>> + Send;
+
+    /// Reads, in one read-only repeatable-read transaction, the chain tail and the whole credit
+    /// ledger, so that pages read later with that tail describe the same committed history.
+    ///
+    /// At most `max_transactions` transactions and twice as many entries are read, and each
+    /// stored text value is read truncated to 129 characters.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditReadError::Exhausted`] when the ledger holds more rows than the bound;
+    /// [`AuditReadError::Transient`] or [`AuditReadError::Permanent`] when the store fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future rolls the read-only transaction back; nothing is held afterwards.
+    fn credit_snapshot(
+        &self,
+        max_transactions: u32,
+    ) -> impl Future<Output = Result<AuditCreditSnapshot, AuditReadError>> + Send;
 }
 
 /// Store failures, shared by the document and exchange stores.

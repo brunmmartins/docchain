@@ -72,3 +72,8 @@ required-features = ["test-support"]
 name = "independent_audit"
 path = "../../tests/system/independent_audit.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "least_privilege"
+path = "../../tests/system/least_privilege.rs"
+required-features = ["test-support"]

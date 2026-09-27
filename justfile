@@ -13,6 +13,13 @@ export PATH := cargo_home + "/bin:" + env("PATH")
 
 locked := if env("CI", "") != "" { "--locked" } else { "" }
 
+# The migration owner's role and password file. Only `migrate`, `test`, and `demo-first-slice`
+# pass them on, and only to their own commands; the server refuses to start with them set.
+# Override with `just migration_owner=<role> migration_owner_password_file=<path> <recipe>`.
+migration_owner := "docchain_owner"
+migration_owner_password_file := "/run/secrets/docchain_owner_key"
+owner_keys := "DOCCHAIN_MIGRATION__USER=" + quote(migration_owner) + " DOCCHAIN_MIGRATION__PASSWORD_FILE=" + quote(migration_owner_password_file)
+
 [private]
 default:
     @{{just_executable()}} --list --unsorted
@@ -59,18 +66,22 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     if cargo nextest --version >/dev/null 2>&1; then
-        cargo nextest run {{locked}} --workspace --all-features --no-tests=warn
+        {{owner_keys}} cargo nextest run {{locked}} --workspace --all-features --no-tests=warn
     else
         echo "cargo-nextest not installed: using cargo test" >&2
-        cargo test {{locked}} --workspace --all-features --all-targets
+        {{owner_keys}} cargo test {{locked}} --workspace --all-features --all-targets
     fi
     cargo test {{locked}} --doc --workspace --all-features
 
 # Prove the complete invented first exchange against isolated PostgreSQL schemas and filesystem roots
 demo-first-slice:
     cargo test {{locked}} -p docchain-server --features test-support --test envelope_vectors
-    cargo test {{locked}} -p docchain-server --features test-support --test send_copy --test acceptance --test replay \
-        --test schema_rejection --test privacy --test integrity --test independent_audit -- --test-threads=1
+    {{owner_keys}} cargo test {{locked}} -p docchain-server --features test-support --test send_copy --test acceptance --test replay \
+        --test schema_rejection --test privacy --test integrity --test independent_audit --test least_privilege -- --test-threads=1
+
+# Apply pending migrations to the configured schema as the migration owner
+migrate:
+    {{owner_keys}} cargo run {{locked}} -p docchain-server --bin docchain-migrate
 
 # Build API documentation; broken intra-doc links fail
 docs:
@@ -92,4 +103,4 @@ deny:
 # Full pre-push gate, identical to CI: formatting, lint, test, docs, deny
 check:
     cargo fmt --all --check
-    {{just_executable()}} lint test docs deny
+    {{just_executable()}} migration_owner={{quote(migration_owner)}} migration_owner_password_file={{quote(migration_owner_password_file)}} lint test docs deny

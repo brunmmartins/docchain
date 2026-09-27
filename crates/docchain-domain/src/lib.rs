@@ -1,5 +1,6 @@
 //! Infrastructure-independent types, strict JSON, schema validation, and event integrity.
 
+mod credit;
 mod event;
 mod json;
 mod pattern;
@@ -7,6 +8,10 @@ mod schema;
 mod time;
 mod types;
 
+pub use credit::{
+    CreditLedgerEntry, CreditLedgerTransaction, CreditMismatch, CreditReconciliation,
+    ISSUANCE_ACCOUNT, acceptance_eligibility_key, reconcile_credits,
+};
 pub use event::{
     AUDIT_PREIMAGE_VERSION, AuditChallenge, AuditEvent, AuditExportManifest, AuditSnapshot,
     Checkpoint, EventDraft, EventKind, envelope_commitment, event_signature_input, sha256,

@@ -58,25 +58,25 @@ pub struct DatabaseSettings {
     pub(crate) schema: DatabaseSchema,
 }
 
-/// A PostgreSQL schema name safe to place in the connection `search_path`.
+/// A PostgreSQL schema name safe to place in the connection `search_path`. It is never
+/// `public`, which is shared by every role and not owned by the project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatabaseSchema(String);
 
 impl DatabaseSchema {
-    fn new(value: &str) -> Result<Self, SettingsError> {
-        let valid = !value.is_empty()
-            && value.len() <= 63
-            && value
-                .bytes()
-                .next()
-                .is_some_and(|byte| byte == b'_' || byte.is_ascii_lowercase())
-            && value
-                .bytes()
-                .all(|byte| byte == b'_' || byte.is_ascii_lowercase() || byte.is_ascii_digit());
-        if !valid {
+    fn new(value: Option<&str>) -> Result<Self, SettingsError> {
+        const KEY: &str = "DOCCHAIN_DATABASE__SCHEMA";
+        let value = value.ok_or(SettingsError::new(KEY, "is required"))?;
+        if !is_identifier(value) {
             return Err(SettingsError::new(
-                "DOCCHAIN_DATABASE__SCHEMA",
+                KEY,
                 "must be a lower-case PostgreSQL identifier",
+            ));
+        }
+        if value == "public" {
+            return Err(SettingsError::new(
+                KEY,
+                "must not be public; use a schema the migration owner owns",
             ));
         }
         Ok(Self(value.to_owned()))
@@ -84,6 +84,95 @@ impl DatabaseSchema {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Whether `value` is a lower-case, unquoted PostgreSQL identifier of at most 63 bytes.
+fn is_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte == b'_' || byte.is_ascii_lowercase())
+        && value
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// Validated settings for `docchain-migrate`, which connects only as the migration owner.
+///
+/// It never reads the runtime role's password. Its `Debug` output hides the owner password.
+#[derive(Clone, Debug)]
+pub struct MigrationSettings {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) name: String,
+    pub(crate) schema: DatabaseSchema,
+    /// The runtime role that migrations grant to, from `DOCCHAIN_DATABASE__USER`.
+    pub(crate) runtime_role: String,
+    /// The migration owner, from `DOCCHAIN_MIGRATION__USER`.
+    pub(crate) owner: String,
+    pub(crate) owner_password: Secret,
+}
+
+impl MigrationSettings {
+    /// Reads the `DOCCHAIN_` environment once and validates the migration settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error naming the missing or malformed key, never its value.
+    pub fn from_env() -> Result<Self, SettingsError> {
+        Self::from_unicode_map(docchain_variables(env::vars_os().collect())?)
+    }
+
+    /// Parses migration settings from a supplied map.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error naming the missing or malformed key, never its value.
+    pub fn from_map(values: HashMap<String, String>) -> Result<Self, SettingsError> {
+        Self::from_unicode_map(docchain_variables(os_map(values))?)
+    }
+
+    fn from_unicode_map(values: HashMap<String, String>) -> Result<Self, SettingsError> {
+        let get = |key: &'static str| values.get(key).map(String::as_str);
+        let (host, port, name, schema) = coordinates(&get)?;
+        let owner = get("DOCCHAIN_MIGRATION__USER")
+            .filter(|value| !value.is_empty())
+            .ok_or(SettingsError::new(
+                "DOCCHAIN_MIGRATION__USER",
+                "is required",
+            ))?
+            .to_owned();
+        let runtime_role = get("DOCCHAIN_DATABASE__USER")
+            .ok_or(SettingsError::new("DOCCHAIN_DATABASE__USER", "is required"))?;
+        if !is_identifier(runtime_role) {
+            return Err(SettingsError::new(
+                "DOCCHAIN_DATABASE__USER",
+                "must be a lower-case PostgreSQL identifier",
+            ));
+        }
+        if runtime_role == owner {
+            return Err(SettingsError::new(
+                "DOCCHAIN_DATABASE__USER",
+                "must differ from DOCCHAIN_MIGRATION__USER",
+            ));
+        }
+        let owner_password = secret(
+            &get,
+            "DOCCHAIN_MIGRATION__PASSWORD",
+            "DOCCHAIN_MIGRATION__PASSWORD_FILE",
+        )?;
+        Ok(Self {
+            host,
+            port,
+            name,
+            schema,
+            runtime_role: runtime_role.to_owned(),
+            owner,
+            owner_password,
+        })
     }
 }
 
@@ -173,74 +262,36 @@ impl Settings {
     ///
     /// Returns a bounded error naming the missing or malformed key.
     pub fn from_map(values: HashMap<String, String>) -> Result<Self, SettingsError> {
-        Self::from_os_map(
-            values
-                .into_iter()
-                .map(|(key, value)| (OsString::from(key), OsString::from(value)))
-                .collect(),
-        )
+        Self::from_os_map(os_map(values))
     }
 
     fn from_os_map(values: HashMap<OsString, OsString>) -> Result<Self, SettingsError> {
-        if values.contains_key(OsStr::new("PGOPTIONS")) {
-            return Err(SettingsError::new(
-                "PGOPTIONS",
-                "must not be set; use DOCCHAIN_DATABASE__SCHEMA",
-            ));
-        }
-        let mut unicode = HashMap::new();
-        for (key, value) in values {
-            let key_lossy = key.to_string_lossy();
-            if !key_lossy.starts_with("DOCCHAIN_") {
-                continue;
-            }
-            let key = key
-                .into_string()
-                .map_err(|_| SettingsError::new("DOCCHAIN_*", "name is not Unicode"))?;
-            let value = value
-                .into_string()
-                .map_err(|_| SettingsError::new(key.clone(), "value is not Unicode"))?;
-            unicode.insert(key, value);
-        }
-        Self::from_unicode_map(unicode)
+        Self::from_unicode_map(docchain_variables(values)?)
     }
 
     fn from_unicode_map(values: HashMap<String, String>) -> Result<Self, SettingsError> {
+        // The server holds exactly one database credential, the runtime role's. A migration
+        // owner key in its environment is refused, naming the first such key.
+        if let Some(key) = values
+            .keys()
+            .filter(|key| key.starts_with("DOCCHAIN_MIGRATION__"))
+            .min()
+        {
+            return Err(SettingsError::new(
+                key.clone(),
+                "must not be set for the server; only docchain-migrate reads it",
+            ));
+        }
         let get = |key: &'static str| values.get(key).map(String::as_str);
-        let host = get("DOCCHAIN_DATABASE__HOST")
-            .unwrap_or("postgres")
-            .to_owned();
-        let port = parse_or(
-            get("DOCCHAIN_DATABASE__PORT"),
-            5432,
-            "DOCCHAIN_DATABASE__PORT",
-        )?;
-        let name = get("DOCCHAIN_DATABASE__NAME")
-            .unwrap_or("docchain")
-            .to_owned();
+        let (host, port, name, schema) = coordinates(&get)?;
         let user = get("DOCCHAIN_DATABASE__USER")
             .unwrap_or("docchain")
             .to_owned();
-        let password = match get("DOCCHAIN_DATABASE__PASSWORD") {
-            Some(value) if !value.is_empty() => Secret(value.to_owned()),
-            Some(_) => {
-                return Err(SettingsError::new(
-                    "DOCCHAIN_DATABASE__PASSWORD",
-                    "must not be empty",
-                ));
-            }
-            None => {
-                let key = "DOCCHAIN_DATABASE__PASSWORD_FILE";
-                let path = required_path(get(key), key)?;
-                let value = std::fs::read_to_string(path)
-                    .map_err(|_| SettingsError::new(key, "cannot read secret file"))?;
-                let value = value.trim_end();
-                if value.is_empty() {
-                    return Err(SettingsError::new(key, "secret file is empty"));
-                }
-                Secret(value.to_owned())
-            }
-        };
+        let password = secret(
+            &get,
+            "DOCCHAIN_DATABASE__PASSWORD",
+            "DOCCHAIN_DATABASE__PASSWORD_FILE",
+        )?;
         let max_connections = parse_or(
             get("DOCCHAIN_DATABASE__MAX_CONNECTIONS"),
             10_u32,
@@ -252,7 +303,6 @@ impl Settings {
                 "must be from 2 through 64",
             ));
         }
-        let schema = DatabaseSchema::new(get("DOCCHAIN_DATABASE__SCHEMA").unwrap_or("public"))?;
 
         let bind = get("DOCCHAIN_HTTP__BIND")
             .unwrap_or("127.0.0.1:3000")
@@ -373,6 +423,81 @@ impl Settings {
     }
 }
 
+/// Refuses `PGOPTIONS`, keeps only `DOCCHAIN_` variables, and requires each to be Unicode.
+fn docchain_variables(
+    values: HashMap<OsString, OsString>,
+) -> Result<HashMap<String, String>, SettingsError> {
+    if values.contains_key(OsStr::new("PGOPTIONS")) {
+        return Err(SettingsError::new(
+            "PGOPTIONS",
+            "must not be set; use DOCCHAIN_DATABASE__SCHEMA",
+        ));
+    }
+    let mut unicode = HashMap::new();
+    for (key, value) in values {
+        let key_lossy = key.to_string_lossy();
+        if !key_lossy.starts_with("DOCCHAIN_") {
+            continue;
+        }
+        let key = key
+            .into_string()
+            .map_err(|_| SettingsError::new("DOCCHAIN_*", "name is not Unicode"))?;
+        let value = value
+            .into_string()
+            .map_err(|_| SettingsError::new(key.clone(), "value is not Unicode"))?;
+        unicode.insert(key, value);
+    }
+    Ok(unicode)
+}
+
+fn os_map(values: HashMap<String, String>) -> HashMap<OsString, OsString> {
+    values
+        .into_iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect()
+}
+
+/// The host, port, database, and schema both binaries read.
+fn coordinates<'a>(
+    get: &impl Fn(&'static str) -> Option<&'a str>,
+) -> Result<(String, u16, String, DatabaseSchema), SettingsError> {
+    let host = get("DOCCHAIN_DATABASE__HOST")
+        .unwrap_or("postgres")
+        .to_owned();
+    let port = parse_or(
+        get("DOCCHAIN_DATABASE__PORT"),
+        5432,
+        "DOCCHAIN_DATABASE__PORT",
+    )?;
+    let name = get("DOCCHAIN_DATABASE__NAME")
+        .unwrap_or("docchain")
+        .to_owned();
+    let schema = DatabaseSchema::new(get("DOCCHAIN_DATABASE__SCHEMA"))?;
+    Ok((host, port, name, schema))
+}
+
+/// A password given directly under `key`, or read from the file `file_key` names.
+fn secret<'a>(
+    get: &impl Fn(&'static str) -> Option<&'a str>,
+    key: &'static str,
+    file_key: &'static str,
+) -> Result<Secret, SettingsError> {
+    match get(key) {
+        Some(value) if !value.is_empty() => Ok(Secret(value.to_owned())),
+        Some(_) => Err(SettingsError::new(key, "must not be empty")),
+        None => {
+            let path = required_path(get(file_key), file_key)?;
+            let value = std::fs::read_to_string(path)
+                .map_err(|_| SettingsError::new(file_key, "cannot read secret file"))?;
+            let value = value.trim_end();
+            if value.is_empty() {
+                return Err(SettingsError::new(file_key, "secret file is empty"));
+            }
+            Ok(Secret(value.to_owned()))
+        }
+    }
+}
+
 fn decode_b64_32(value: &str, key: &'static str) -> Result<[u8; 32], SettingsError> {
     if value.contains('=') || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(SettingsError::new(
@@ -456,7 +581,8 @@ mod tests {
         let settings = complete_settings().expect("settings");
         assert_eq!(settings.database.port, 5432);
         assert_eq!(settings.database.max_connections, 10);
-        assert_eq!(settings.database.schema.as_str(), "public");
+        assert_eq!(settings.database.schema.as_str(), "docchain");
+        assert_eq!(settings.database.user, "docchain");
         assert_eq!(
             settings.http.bind,
             "127.0.0.1:3000".parse().expect("address")
@@ -576,6 +702,140 @@ mod tests {
         assert!(!error.to_string().contains('\u{fffd}'));
     }
 
+    #[test]
+    fn both_loaders_require_a_schema_other_than_public() {
+        for value in [None, Some("public"), Some("Public"), Some("")] {
+            let mut server = complete_values();
+            let mut migrator = migration_values();
+            match value {
+                Some(value) => {
+                    server.insert("DOCCHAIN_DATABASE__SCHEMA".to_owned(), value.to_owned());
+                    migrator.insert("DOCCHAIN_DATABASE__SCHEMA".to_owned(), value.to_owned());
+                }
+                None => {
+                    server.remove("DOCCHAIN_DATABASE__SCHEMA");
+                    migrator.remove("DOCCHAIN_DATABASE__SCHEMA");
+                }
+            }
+            let server = Settings::from_map(server).expect_err("server schema");
+            let migrator = MigrationSettings::from_map(migrator).expect_err("migrator schema");
+            for error in [server, migrator] {
+                assert_eq!(error.key, "DOCCHAIN_DATABASE__SCHEMA", "{value:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn server_refuses_any_migration_owner_key_naming_it() {
+        for key in [
+            "DOCCHAIN_MIGRATION__USER",
+            "DOCCHAIN_MIGRATION__PASSWORD",
+            "DOCCHAIN_MIGRATION__PASSWORD_FILE",
+            "DOCCHAIN_MIGRATION__OTHER",
+        ] {
+            let mut values = complete_values();
+            values.insert(key.to_owned(), "invented-owner-value".to_owned());
+            let error = Settings::from_map(values).expect_err(key);
+            assert_eq!(error.key, key);
+            assert!(!error.to_string().contains("invented-owner-value"));
+        }
+        let mut values = complete_values();
+        values.insert("DOCCHAIN_MIGRATION__USER".to_owned(), "owner".to_owned());
+        values.insert(
+            "DOCCHAIN_MIGRATION__PASSWORD_FILE".to_owned(),
+            "/private/owner".to_owned(),
+        );
+        assert_eq!(
+            Settings::from_map(values).expect_err("two keys").key,
+            "DOCCHAIN_MIGRATION__PASSWORD_FILE"
+        );
+    }
+
+    #[test]
+    fn migration_settings_read_only_the_owner_credential() {
+        let settings = MigrationSettings::from_map(migration_values()).expect("settings");
+        assert_eq!(
+            (
+                settings.owner.as_str(),
+                settings.runtime_role.as_str(),
+                settings.schema.as_str(),
+                settings.owner_password.expose(),
+            ),
+            (
+                "docchain_owner",
+                "docchain_runtime",
+                "docchain",
+                "owner-secret"
+            )
+        );
+        // The runtime password is never read, even when its file cannot be.
+        let mut values = migration_values();
+        values.insert(
+            "DOCCHAIN_DATABASE__PASSWORD_FILE".to_owned(),
+            "/nonexistent/runtime".to_owned(),
+        );
+        assert!(MigrationSettings::from_map(values).is_ok());
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("owner-secret"));
+        assert!(debug.contains("Secret(redacted)"));
+    }
+
+    #[test]
+    fn migration_settings_name_each_bad_key() {
+        let cases: [(&str, Option<&str>, &str); 7] = [
+            ("DOCCHAIN_MIGRATION__USER", None, "DOCCHAIN_MIGRATION__USER"),
+            (
+                "DOCCHAIN_MIGRATION__USER",
+                Some(""),
+                "DOCCHAIN_MIGRATION__USER",
+            ),
+            (
+                "DOCCHAIN_MIGRATION__USER",
+                Some("docchain_runtime"),
+                "DOCCHAIN_DATABASE__USER",
+            ),
+            ("DOCCHAIN_DATABASE__USER", None, "DOCCHAIN_DATABASE__USER"),
+            (
+                "DOCCHAIN_DATABASE__USER",
+                Some("Runtime"),
+                "DOCCHAIN_DATABASE__USER",
+            ),
+            (
+                "DOCCHAIN_DATABASE__USER",
+                Some("runtime; drop"),
+                "DOCCHAIN_DATABASE__USER",
+            ),
+            (
+                "DOCCHAIN_MIGRATION__PASSWORD",
+                None,
+                "DOCCHAIN_MIGRATION__PASSWORD_FILE",
+            ),
+        ];
+        for (key, value, named) in cases {
+            let mut values = migration_values();
+            match value {
+                Some(value) => values.insert(key.to_owned(), value.to_owned()),
+                None => values.remove(key),
+            };
+            let error = MigrationSettings::from_map(values).expect_err(key);
+            assert_eq!(error.key, named, "{key} = {value:?}");
+            assert!(!error.to_string().contains("owner-secret"));
+        }
+    }
+
+    fn migration_values() -> HashMap<String, String> {
+        let mut values = HashMap::new();
+        for (key, value) in [
+            ("DOCCHAIN_DATABASE__SCHEMA", "docchain"),
+            ("DOCCHAIN_DATABASE__USER", "docchain_runtime"),
+            ("DOCCHAIN_MIGRATION__USER", "docchain_owner"),
+            ("DOCCHAIN_MIGRATION__PASSWORD", "owner-secret"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+        values
+    }
+
     fn complete_settings() -> Result<Settings, SettingsError> {
         Settings::from_map(complete_values())
     }
@@ -585,6 +845,10 @@ mod tests {
         values.insert(
             "DOCCHAIN_DATABASE__PASSWORD".to_owned(),
             "secret".to_owned(),
+        );
+        values.insert(
+            "DOCCHAIN_DATABASE__SCHEMA".to_owned(),
+            "docchain".to_owned(),
         );
         values.insert(
             "DOCCHAIN_DOCUMENT_STORE__ROOT".to_owned(),
