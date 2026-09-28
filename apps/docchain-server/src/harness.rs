@@ -6,7 +6,7 @@ use std::sync::Arc;
 use docchain_application::{
     AcceptanceResult, Actor, Adapters, Application, ApplicationError, AuditExportPage,
     AuditExportRequest, AuditKeyPin, AuditPublicKey, AuditReport, AuditSettings, Credential,
-    Delivery, EventIntegrity as _, Limits, SendCopyCommand,
+    Delivery, EventIntegrity as _, Limits, SendCopyCommand, StoreSweep, SweepError, sweep_debris,
 };
 #[cfg(feature = "test-support")]
 use docchain_application::{AuditEventStore as _, AuditReadRequest};
@@ -18,6 +18,8 @@ use thiserror::Error;
 
 #[cfg(feature = "test-support")]
 use crate::config::MigrationSettings;
+#[cfg(feature = "test-support")]
+use crate::store::{PauseGate, ScanFault};
 use crate::{
     config::{DatabaseSettings, Settings},
     crypto::CryptoEngine,
@@ -25,10 +27,30 @@ use crate::{
         AuditKey, FileIdentity, FileKeyRegistry, StaticSchemaRegistry, SystemClock, load_key_files,
     },
     store::{
-        FileDocumentStore, MigrationState, PgExchangeStore, migration_state,
-        runtime_privilege_violations, schema_exists, session_roles,
+        FileDocumentStore, LeaseError, LeaseHooks, MigrationState, PgExchangeStore, StoreLease,
+        SweepBounds, migration_state, runtime_privilege_violations, schema_exists, session_roles,
     },
 };
+
+/// How one start runs its lease and sweep. Production uses the default: every bound at its
+/// named constant, and no test hook.
+#[derive(Clone, Debug, Default)]
+pub struct StartOptions {
+    /// Lease, drain, and sweep bounds.
+    pub bounds: SweepBounds,
+    /// Reached once the writer drain has recorded at least one transaction.
+    #[cfg(feature = "test-support")]
+    pub drain_recorded: Option<PauseGate>,
+    /// A failure injected into the reference read.
+    #[cfg(feature = "test-support")]
+    pub scan_fault: Option<ScanFault>,
+    /// Pauses each send after its object is written.
+    #[cfg(feature = "test-support")]
+    pub after_put_new: Option<PauseGate>,
+    /// Pauses each send inside its transaction, before `COMMIT`.
+    #[cfg(feature = "test-support")]
+    pub before_send_commit: Option<PauseGate>,
+}
 
 /// Concrete statically-dispatched local adapters.
 pub struct ServerAdapters {
@@ -162,6 +184,16 @@ pub(crate) fn migration_connect_options(
 /// Fully composed local service. HTTP and test adapters call these use cases.
 pub struct DocchainService {
     application: Application<ServerAdapters>,
+    /// Held until the service drops, which releases both locks.
+    #[cfg_attr(
+        not(feature = "test-support"),
+        expect(
+            dead_code,
+            reason = "held only so that dropping the service releases it"
+        )
+    )]
+    lease: std::sync::Mutex<Option<StoreLease>>,
+    sweep: StoreSweep,
 }
 
 impl DocchainService {
@@ -177,19 +209,27 @@ impl DocchainService {
     /// [`ServiceError::Initialization`] naming the first failed step, never a user, password,
     /// path, SQL error, or which part of the privilege rule failed.
     pub async fn compose(settings: &Settings) -> Result<Self, ServiceError> {
-        Self::compose_with_limits(settings, Limits::default()).await
+        Self::compose_with(settings, Limits::default(), StartOptions::default()).await
     }
 
-    async fn compose_with_limits(
+    /// The startup sweep's outcome, which `Display`s as the one report line: counts or a skip
+    /// reason, never an object ID, path, or database identifier.
+    #[must_use]
+    pub const fn sweep_report(&self) -> StoreSweep {
+        self.sweep
+    }
+
+    pub(crate) async fn compose_with(
         settings: &Settings,
         limits: Limits,
+        start: StartOptions,
     ) -> Result<Self, ServiceError> {
         let database = &settings.database;
         let options = connect_options(database);
         let pool = PgPoolOptions::new()
             .max_connections(database.max_connections)
             .acquire_timeout(std::time::Duration::from_secs(5))
-            .connect_with(options)
+            .connect_with(options.clone())
             .await
             .map_err(|_| ServiceError::Initialization("database connection"))?;
         check_database(&pool, database.schema.as_str()).await?;
@@ -214,23 +254,78 @@ impl DocchainService {
             settings.audit.default_page_size,
         )
         .map_err(|_| ServiceError::Initialization("audit settings"))?;
+        let identity = FileIdentity::load(&settings.identity_credentials_file)
+            .map_err(|_| ServiceError::Initialization("identity credentials file"))?;
+        let keys = FileKeyRegistry::load(&settings.keys)
+            .map_err(|_| ServiceError::Initialization("key-binding registry"))?;
+        let crypto = CryptoEngine::new(signing, encryption)
+            .map_err(|_| ServiceError::Initialization("wallet key material"))?;
+        let bounds = start.bounds;
+        let documents = FileDocumentStore::new(settings.document_store_root.clone())
+            .await
+            .map_err(|_| ServiceError::Initialization("document store root"))?
+            .with_bounds(bounds);
+        let exchanges =
+            PgExchangeStore::new(pool, database.schema.as_str().to_owned()).with_bounds(bounds);
+        #[cfg(feature = "test-support")]
+        let (documents, exchanges) = {
+            let documents = match start.after_put_new.clone() {
+                Some(gate) => documents.with_put_new_gate(gate),
+                None => documents,
+            };
+            let exchanges = match start.before_send_commit.clone() {
+                Some(gate) => exchanges.with_commit_gate(gate),
+                None => exchanges,
+            };
+            (documents, exchanges.with_scan_fault(start.scan_fault))
+        };
+        let hooks = LeaseHooks {
+            #[cfg(feature = "test-support")]
+            drain_recorded: start.drain_recorded.clone(),
+        };
+        let (mut lease, permit) = StoreLease::acquire(
+            &options,
+            database.schema.as_str(),
+            &documents,
+            &bounds,
+            &hooks,
+        )
+        .await
+        .map_err(|error| {
+            ServiceError::Initialization(match error {
+                LeaseError::Exclusivity => "document store exclusivity",
+                LeaseError::Binding => "document store binding",
+            })
+        })?;
+        let sweep = match sweep_debris(permit, &documents, &exchanges).await {
+            Ok(sweep) => sweep,
+            Err(error) => {
+                lease.release().await;
+                return Err(ServiceError::Initialization(match error {
+                    SweepError::Inventory => "document store inventory",
+                    SweepError::References => "document store references",
+                    SweepError::Removal => "document store sweep",
+                }));
+            }
+        };
+        if lease.downgrade(&bounds).await.is_err() {
+            lease.release().await;
+            return Err(ServiceError::Initialization("document store exclusivity"));
+        }
         let adapters = ServerAdapters {
-            identity: FileIdentity::load(&settings.identity_credentials_file)
-                .map_err(|_| ServiceError::Initialization("identity credentials file"))?,
+            identity,
             schemas: StaticSchemaRegistry,
-            keys: FileKeyRegistry::load(&settings.keys)
-                .map_err(|_| ServiceError::Initialization("key-binding registry"))?,
-            crypto: CryptoEngine::new(signing, encryption)
-                .map_err(|_| ServiceError::Initialization("wallet key material"))?,
+            keys,
+            crypto,
             integrity,
-            documents: FileDocumentStore::new(settings.document_store_root.clone())
-                .await
-                .map_err(|_| ServiceError::Initialization("document store root"))?,
-            exchanges: PgExchangeStore::new(pool),
+            documents,
+            exchanges,
             clock: SystemClock,
         };
         Ok(Self {
             application: Application::new(adapters, limits, audit),
+            lease: std::sync::Mutex::new(Some(lease)),
+            sweep,
         })
     }
 
@@ -330,6 +425,19 @@ impl DocchainService {
     pub(crate) fn pool(&self) -> &sqlx::PgPool {
         self.application.adapters().exchanges.pool()
     }
+
+    /// Releases the lease alone, as a process exit would; the pool stays open.
+    #[cfg(feature = "test-support")]
+    async fn release_lease(&self) {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(lease) = lease {
+            lease.release().await;
+        }
+    }
 }
 
 /// The read-only startup checks on one pooled connection, in order, each failing with its own
@@ -385,8 +493,12 @@ pub struct StateStats {
 /// Test-only fixture composition. Default builds expose no deterministic key injection.
 #[cfg(feature = "test-support")]
 pub struct DemoHarness {
-    service: Arc<DocchainService>,
+    /// `None` after [`DemoHarness::release_service`] or a failed restart.
+    service: Option<Arc<DocchainService>>,
     database: DatabaseFixture,
+    limits: Limits,
+    after_put_new: PauseGate,
+    before_send_commit: PauseGate,
     pub sender_credential: String,
     pub recipient_credential: String,
     pub unrelated_credential: String,
@@ -946,8 +1058,18 @@ impl DemoHarness {
     async fn compose_fixture(fixture: FixtureFiles, limits: Limits) -> Result<Self, ServiceError> {
         let database = DatabaseFixture::create(fixture).await?;
         database.migrate().await?;
-        let service =
-            DocchainService::compose_with_limits(&database.fixture.settings, limits).await?;
+        let after_put_new = PauseGate::default();
+        let before_send_commit = PauseGate::default();
+        let service = DocchainService::compose_with(
+            &database.fixture.settings,
+            limits,
+            StartOptions {
+                after_put_new: Some(after_put_new.clone()),
+                before_send_commit: Some(before_send_commit.clone()),
+                ..StartOptions::default()
+            },
+        )
+        .await?;
         let [
             sender_credential,
             recipient_credential,
@@ -957,8 +1079,11 @@ impl DemoHarness {
             operator_credential,
         ] = database.fixture.credentials.clone();
         Ok(Self {
-            service: Arc::new(service),
+            service: Some(Arc::new(service)),
             database,
+            limits,
+            after_put_new,
+            before_send_commit,
             sender_credential,
             recipient_credential,
             unrelated_credential,
@@ -997,11 +1122,150 @@ impl DemoHarness {
         )
     }
 
+    /// The running in-process service.
+    ///
+    /// # Panics
+    ///
+    /// After [`DemoHarness::release_service`], or a restart that failed, until a restart
+    /// succeeds.
     pub fn service(&self) -> Arc<DocchainService> {
-        Arc::clone(&self.service)
+        Arc::clone(
+            self.service
+                .as_ref()
+                .expect("the harness's service is running; restart it after a release"),
+        )
+    }
+
+    fn running(&self) -> Result<&DocchainService, ServiceError> {
+        self.service.as_deref().ok_or(ServiceError::Inspection)
+    }
+
+    /// The document store root the service and the server binary use.
+    pub fn document_root(&self) -> std::path::PathBuf {
+        self.database.fixture.object_root.clone()
+    }
+
+    /// The gate every send of this harness's services passes after writing its object.
+    pub fn after_put_new_gate(&self) -> PauseGate {
+        self.after_put_new.clone()
+    }
+
+    /// The gate every send of this harness's services passes inside its transaction, just
+    /// before `COMMIT`.
+    pub fn before_send_commit_gate(&self) -> PauseGate {
+        self.before_send_commit.clone()
+    }
+
+    /// Start options for this harness's schema and root, with its two send gates.
+    fn with_gates(&self, options: StartOptions) -> StartOptions {
+        StartOptions {
+            after_put_new: Some(self.after_put_new.clone()),
+            before_send_commit: Some(self.before_send_commit.clone()),
+            ..options
+        }
+    }
+
+    /// Stops the in-process service as a process exit would: its lease session and lock file
+    /// close, and its pool closes. Returns once PostgreSQL no longer shows the schema lock.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Inspection`] when no service runs, when another `Arc` to it remains
+    /// (the service is kept running), or when the schema lock is still held after five seconds.
+    pub async fn release_service(&mut self) -> Result<(), ServiceError> {
+        let service = self.service.take().ok_or(ServiceError::Inspection)?;
+        let service = match Arc::try_unwrap(service) {
+            Ok(service) => service,
+            Err(shared) => {
+                self.service = Some(shared);
+                return Err(ServiceError::Inspection);
+            }
+        };
+        service.release_lease().await;
+        service
+            .application
+            .adapters()
+            .exchanges
+            .pool()
+            .close()
+            .await;
+        drop(service);
+        self.wait_for_schema_lock_release().await
+    }
+
+    /// Releases only the running service's lease, as its process exit would, while its pool and
+    /// any open transaction stay. Returns once PostgreSQL no longer shows the schema lock.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Inspection`] when no service runs or the lock stays held.
+    pub async fn release_lease(&self) -> Result<(), ServiceError> {
+        self.running()?.release_lease().await;
+        self.wait_for_schema_lock_release().await
+    }
+
+    /// Releases the running service, if any, then composes a new one on the same schema and
+    /// root with `options`, and returns its sweep report. When composition fails, no service
+    /// runs until a later restart succeeds.
+    ///
+    /// # Errors
+    ///
+    /// The release's error, or the composition's [`ServiceError::Initialization`].
+    pub async fn restart(&mut self, options: StartOptions) -> Result<StoreSweep, ServiceError> {
+        if self.service.is_some() {
+            self.release_service().await?;
+        }
+        let service = DocchainService::compose_with(
+            &self.database.fixture.settings,
+            self.limits,
+            self.with_gates(options),
+        )
+        .await?;
+        let report = service.sweep_report();
+        self.service = Some(Arc::new(service));
+        Ok(report)
+    }
+
+    /// A composition of a second, independent service on this harness's schema and root, as
+    /// another server process would start; it can be spawned onto its own task.
+    pub fn start_instance(
+        &self,
+        options: StartOptions,
+    ) -> impl std::future::Future<Output = Result<DocchainService, ServiceError>> + Send + 'static
+    {
+        let settings = self.database.fixture.settings.clone();
+        let limits = self.limits;
+        let options = self.with_gates(options);
+        async move { DocchainService::compose_with(&settings, limits, options).await }
+    }
+
+    /// Polls, as the owner, until no session holds this schema's lease lock, for at most five
+    /// seconds.
+    async fn wait_for_schema_lock_release(&self) -> Result<(), ServiceError> {
+        let started = std::time::Instant::now();
+        loop {
+            let held: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks l \
+                 WHERE l.locktype = 'advisory' AND l.objsubid = 1 \
+                 AND l.classid::bigint = x'44435357'::bigint \
+                 AND l.objid::bigint = (SELECT oid::bigint FROM pg_catalog.pg_namespace \
+                 WHERE nspname = $1))",
+            )
+            .bind(&self.database.fixture.schema)
+            .fetch_one(&self.database.owner)
+            .await
+            .map_err(|_| ServiceError::Inspection)?;
+            if !held {
+                return Ok(());
+            }
+            if started.elapsed() > std::time::Duration::from_secs(5) {
+                return Err(ServiceError::Inspection);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
     pub async fn actor(&self, credential: &str) -> Result<Actor, ServiceError> {
-        self.service
+        self.running()?
             .authenticate(Credential::new(credential.to_owned()))
             .await
     }
@@ -1010,7 +1274,7 @@ impl DemoHarness {
         actor: &Actor,
         command: SendCopyCommand,
     ) -> Result<Delivery, ServiceError> {
-        self.service.send_copy(actor, command).await
+        self.running()?.send_copy(actor, command).await
     }
     pub async fn accept(
         &self,
@@ -1018,28 +1282,28 @@ impl DemoHarness {
         exchange: &ExchangeId,
         key: &IdempotencyKey,
     ) -> Result<AcceptanceResult, ServiceError> {
-        self.service.accept(actor, exchange, key).await
+        self.running()?.accept(actor, exchange, key).await
     }
     pub async fn read_document(
         &self,
         actor: &Actor,
         exchange: &ExchangeId,
     ) -> Result<Vec<u8>, ServiceError> {
-        self.service.read_document(actor, exchange).await
+        self.running()?.read_document(actor, exchange).await
     }
     pub async fn list_inbox(
         &self,
         actor: &Actor,
         wallet: &WalletId,
     ) -> Result<Vec<ExchangeId>, ServiceError> {
-        self.service.list_inbox(actor, wallet).await
+        self.running()?.list_inbox(actor, wallet).await
     }
     pub async fn verify_audit(
         &self,
         expected: Option<Checkpoint>,
     ) -> Result<AuditReport, ServiceError> {
         let actor = self.actor(&self.auditor_credential).await?;
-        self.service.verify_audit(&actor, expected).await
+        self.running()?.verify_audit(&actor, expected).await
     }
     /// The fixture-owned trust anchor supplied independently of any HTTP response.
     pub fn expected_audit_fingerprint(&self) -> [u8; 32] {
@@ -1047,14 +1311,14 @@ impl DemoHarness {
     }
     pub async fn audit_public_key(&self) -> Result<AuditPublicKey, ServiceError> {
         let actor = self.actor(&self.auditor_credential).await?;
-        self.service.audit_public_key(&actor)
+        self.running()?.audit_public_key(&actor)
     }
     pub async fn export_audit_events(
         &self,
         request: AuditExportRequest,
     ) -> Result<AuditExportPage, ServiceError> {
         let actor = self.actor(&self.auditor_credential).await?;
-        self.service.export_audit_events(&actor, request).await
+        self.running()?.export_audit_events(&actor, request).await
     }
     pub async fn stats(&self) -> Result<StateStats, ServiceError> {
         let pool = &self.database.owner;
@@ -1077,14 +1341,24 @@ impl DemoHarness {
         let mut directory = tokio::fs::read_dir(&self.database.fixture.object_root)
             .await
             .map_err(|_| ServiceError::Inspection)?;
+        // Only regular files with object names: control files, temporaries, and foreign entries
+        // are not objects.
         let mut objects = 0_usize;
-        while directory
+        while let Some(entry) = directory
             .next_entry()
             .await
             .map_err(|_| ServiceError::Inspection)?
-            .is_some()
         {
-            objects = objects.saturating_add(1);
+            let is_file = entry
+                .file_type()
+                .await
+                .map_err(|_| ServiceError::Inspection)?
+                .is_file();
+            if is_file
+                && docchain_domain::ObjectId::new(entry.file_name().to_string_lossy()).is_ok()
+            {
+                objects = objects.saturating_add(1);
+            }
         }
         Ok(StateStats {
             delivered,
@@ -1117,7 +1391,7 @@ impl DemoHarness {
     }
     pub async fn audit_events(&self) -> Result<Vec<docchain_domain::AuditEvent>, ServiceError> {
         let mut page = self
-            .service
+            .running()?
             .application
             .adapters()
             .exchanges
@@ -1145,7 +1419,7 @@ impl DemoHarness {
                 .map(|event| event.sequence)
                 .ok_or(ServiceError::Inspection)?;
             page = self
-                .service
+                .running()?
                 .application
                 .adapters()
                 .exchanges

@@ -33,10 +33,13 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Settings, migrations, adapters, signal listeners, then the TCP listener.
+/// Settings, database checks, adapters, the document-store lease and sweep, the sweep's report
+/// line, signal listeners, then the TCP listener.
 async fn run() -> Result<(), StartupError> {
     let settings = Settings::from_env()?;
     let service = Arc::new(DocchainService::compose(&settings).await?);
+    // One line with counts or a skip reason only.
+    eprintln!("docchain-server: {}", service.sweep_report());
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| StartupError::Signal)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(|_| StartupError::Signal)?;
     let listener = tokio::net::TcpListener::bind(settings.http.bind)

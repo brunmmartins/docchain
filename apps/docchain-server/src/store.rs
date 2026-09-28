@@ -27,6 +27,64 @@ use sqlx::{
 };
 use tokio::{fs, io::AsyncWriteExt as _, sync::Mutex, task::JoinHandle};
 
+mod lease;
+mod sweep;
+
+pub(crate) use lease::{LeaseError, LeaseHooks, StoreLease};
+use sweep::RootIdentity;
+#[cfg(feature = "test-support")]
+pub use sweep::ScanFault;
+pub use sweep::SweepBounds;
+
+/// A test-support pause point. While armed, a task that reaches it waits until it is opened;
+/// every arrival is counted, armed or not, so a test can also wait for a step to be reached.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub struct PauseGate(std::sync::Arc<tokio::sync::watch::Sender<GateState>>);
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Default)]
+struct GateState {
+    armed: bool,
+    reached: usize,
+}
+
+#[cfg(feature = "test-support")]
+impl Default for PauseGate {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::watch::Sender::new(
+            GateState::default(),
+        )))
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl PauseGate {
+    /// Makes the next arrivals wait.
+    pub fn arm(&self) {
+        self.0.send_modify(|state| state.armed = true);
+    }
+
+    /// Releases every waiting task and lets later arrivals pass.
+    pub fn open(&self) {
+        self.0.send_modify(|state| state.armed = false);
+    }
+
+    /// Waits until at least `count` arrivals in total have reached the gate.
+    pub async fn reached(&self, count: usize) {
+        let mut state = self.0.subscribe();
+        let _ = state.wait_for(|state| state.reached >= count).await;
+    }
+
+    /// Counts one arrival, then waits while the gate is armed.
+    pub(crate) async fn pass(&self) {
+        let mut state = self.0.subscribe();
+        self.0
+            .send_modify(|state| state.reached = state.reached.saturating_add(1));
+        let _ = state.wait_for(|state| !state.armed).await;
+    }
+}
+
 /// The forward-only migrations, embedded so the binary does not depend on the source tree.
 ///
 /// Every file in `migrations/` must appear here, in version order; a unit test compares this list
@@ -555,6 +613,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// drive unbounded file creation and `fsync`.
 pub struct FileDocumentStore {
     root: PathBuf,
+    identity: RootIdentity,
+    bounds: SweepBounds,
+    #[cfg(feature = "test-support")]
+    after_put_new: Option<PauseGate>,
     probe: Mutex<ProbeState>,
     probe_ttl: Duration,
     probe_timeout: Duration,
@@ -622,13 +684,41 @@ impl FileDocumentStore {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(StoreError::Permanent);
         }
+        let identity = RootIdentity::of(&root)?;
         Ok(Self {
             root,
+            identity,
+            bounds: SweepBounds::DEFAULT,
+            #[cfg(feature = "test-support")]
+            after_put_new: None,
             probe: Mutex::new(ProbeState::default()),
             probe_ttl,
             probe_timeout,
             hooks,
         })
+    }
+
+    /// The same store with shortened sweep bounds; only test support passes others.
+    pub(crate) const fn with_bounds(mut self, bounds: SweepBounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// The same store, pausing at `gate` after each `put_new` succeeds.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_put_new_gate(mut self, gate: PauseGate) -> Self {
+        self.after_put_new = Some(gate);
+        self
+    }
+
+    /// The configured root.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The root's device and inode when the store was opened.
+    pub(crate) const fn identity(&self) -> RootIdentity {
+        self.identity
     }
 
     fn path(&self, object_id: &ObjectId) -> PathBuf {
@@ -698,6 +788,10 @@ impl DocumentStore for FileDocumentStore {
         match fs::hard_link(&temporary, &target).await {
             Ok(()) => {
                 fs::remove_file(&temporary).await.map_err(map_io)?;
+                #[cfg(feature = "test-support")]
+                if let Some(gate) = &self.after_put_new {
+                    gate.pass().await;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -774,14 +868,49 @@ fn map_io_conflict(error: std::io::Error) -> StoreError {
 /// PostgreSQL authoritative event, exchange, and balanced-credit adapter.
 pub struct PgExchangeStore {
     pool: PgPool,
+    /// The validated configured schema, which qualifies the reference read.
+    schema: String,
+    bounds: SweepBounds,
+    #[cfg(feature = "test-support")]
+    before_send_commit: Option<PauseGate>,
+    #[cfg(feature = "test-support")]
+    scan_fault: Option<ScanFault>,
 }
 
 impl PgExchangeStore {
-    pub(crate) const fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub(crate) const fn new(pool: PgPool, schema: String) -> Self {
+        Self {
+            pool,
+            schema,
+            bounds: SweepBounds::DEFAULT,
+            #[cfg(feature = "test-support")]
+            before_send_commit: None,
+            #[cfg(feature = "test-support")]
+            scan_fault: None,
+        }
     }
 
-    #[cfg(all(test, feature = "test-support"))]
+    /// The same store with shortened sweep bounds; only test support passes others.
+    pub(crate) const fn with_bounds(mut self, bounds: SweepBounds) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// The same store, pausing at `gate` inside each send transaction before its `COMMIT`.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_commit_gate(mut self, gate: PauseGate) -> Self {
+        self.before_send_commit = Some(gate);
+        self
+    }
+
+    /// The same store, failing its reference read with `fault`.
+    #[cfg(feature = "test-support")]
+    pub(crate) const fn with_scan_fault(mut self, fault: Option<ScanFault>) -> Self {
+        self.scan_fault = fault;
+        self
+    }
+
+    #[cfg(feature = "test-support")]
     pub(crate) const fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -900,6 +1029,10 @@ impl ExchangeStore for PgExchangeStore {
         .await
         .map_err(map_sql)?;
         append_event(&mut transaction, event, integrity).await?;
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = &self.before_send_commit {
+            gate.pass().await;
+        }
         transaction.commit().await.map_err(map_sql)
     }
 
@@ -2059,7 +2192,10 @@ mod tests {
             let (fixture, _owner) = migrated().await;
             let audit_key_path = fixture.root.join("audit.key");
             let integrity = AuditKey::load(&audit_key_path).expect("audit key");
-            let store = PgExchangeStore::new(fixture.runtime_pool().await.expect("runtime pool"));
+            let store = PgExchangeStore::new(
+                fixture.runtime_pool().await.expect("runtime pool"),
+                fixture.schema.clone(),
+            );
             // 1970-01-02T00:00:00Z: no clock read during this test can produce it.
             let committed_at = Timestamp::from_unix_seconds(86_400);
             let sender = WalletId::new("wal_0000000000000001").expect("wallet");
@@ -2184,7 +2320,10 @@ mod tests {
 
             let (fixture, pool) = migrated().await;
             let integrity = AuditKey::load(&fixture.root.join("audit.key")).expect("audit key");
-            let store = PgExchangeStore::new(fixture.runtime_pool().await.expect("runtime pool"));
+            let store = PgExchangeStore::new(
+                fixture.runtime_pool().await.expect("runtime pool"),
+                fixture.schema.clone(),
+            );
             let send = |index: u8| {
                 let record = ExchangeRecord {
                     exchange_id: ExchangeId::new(format!(
@@ -2651,7 +2790,10 @@ mod tests {
 
             let (fixture, owner) = migrated().await;
             let integrity = AuditKey::load(&fixture.root.join("audit.key")).expect("audit key");
-            let store = PgExchangeStore::new(fixture.runtime_pool().await.expect("runtime pool"));
+            let store = PgExchangeStore::new(
+                fixture.runtime_pool().await.expect("runtime pool"),
+                fixture.schema.clone(),
+            );
             let record = |index: u8| ExchangeRecord {
                 exchange_id: ExchangeId::new(format!(
                     "exc_000000000000000000000000000000{index:02}"

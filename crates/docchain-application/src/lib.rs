@@ -3,6 +3,7 @@
 mod model;
 mod ports;
 mod service;
+mod sweep;
 
 pub use model::{
     AcceptanceResult, Actor, ApplicationError, AuditExportEvent, AuditExportPage,
@@ -18,3 +19,7 @@ pub use ports::{
     StoreError, VerifiedBinding,
 };
 pub use service::Application;
+pub use sweep::{
+    DebrisEntry, DebrisInventory, Inventory, ReferenceScan, RemovedCounts, StoreSweep, SweepCounts,
+    SweepError, SweepPermit, SweepSkip, sweep_debris,
+};

@@ -83,7 +83,9 @@ order, that the schema exists, that every embedded migration is applied unchange
 connection's schema is `DOCCHAIN_DATABASE__SCHEMA`, and that its role holds exactly the runtime
 privileges below; otherwise it exits nonzero with one of `database schema`,
 `database migrations pending`, `database migrations mismatch`, or `database role privileges`, and
-never names a user, password, path, or which privilege failed. Standard input is ignored. SIGINT or
+never names a user, password, path, or which privilege failed. It then loads its key and identity
+files, takes the document-store lease, and runs the startup sweep described in
+[Document store root](#document-store-root). Standard input is ignored. SIGINT or
 SIGTERM stops intake and drains admitted requests; a complete drain exits zero, while exceeding the
 configured shutdown deadline cancels the remaining requests, which receive `503` with the category
 `dependency-failure` if their connection is still open, and exits nonzero. A cancelled send retried
@@ -125,6 +127,43 @@ variables that the recipe sets; a missing variable fails the test and names it. 
 migrates, inspects, and drops each schema, and the service under test uses only the runtime role.
 Tests refuse a superuser for either role, never create or alter roles, and never start, stop,
 reset, or delete the PostgreSQL service.
+
+### Document store root
+
+The server owns three names in `DOCCHAIN_DOCUMENT_STORE__ROOT`: `.docchain-lock`, `.docchain-binding`,
+and, briefly, `.docchain-binding.tmp`. Each is created with mode `0600`, never through a symlink, and
+a control file that is a symlink, is not a regular file, or has group or other permission bits stops
+startup.
+
+- **Lease.** Every running server holds a shared lock on its schema, through one extra PostgreSQL
+  connection outside its pool, and a shared `flock` on `.docchain-lock`, until it exits. Only a start
+  that obtains both locks exclusively may remove anything. Every server that uses a root must be a
+  current build that holds this lease; an older build does not take it and is not excluded. Sharing a
+  root across hosts is unsupported.
+- **Binding.** `.docchain-binding` ties the root to one schema of one PostgreSQL cluster and
+  database. The server writes it once, only into a root that holds no object or temporary names, and
+  never rewrites it. A root bound to another schema, or a binding that is unreadable or malformed,
+  stops startup at `document store binding`, before anything is written: point the server at the
+  right schema, or empty the root with a reset that validates its target. Copying a binding into
+  another root declares that root to belong to that schema. An unbound root that already holds
+  objects is never swept.
+- **Startup sweep.** Before it listens, an exclusive start waits up to 10 seconds for transactions
+  already open on the schema to end, lists the root (at most 100,000 entries), and reads every stored
+  object reference in one snapshot. It then removes each object file that no stored reference names
+  and each `.<object>.tmp` file an interrupted write left. Symlinks, directories, special files, and
+  other names are never followed or removed. An object copied into a bound root is removed at the
+  next exclusive start unless a stored reference names it.
+- **Report.** The server writes one line to standard error before it listens:
+  `docchain-server: document store sweep: removed <n> objects and <n> temporary files; kept <n> referenced objects; skipped <n> entries`,
+  or `docchain-server: document store sweep skipped: <reason>`, where the reason is
+  `exclusivity not obtained` (another server holds the schema or root), `store root not bound`,
+  `earlier transactions still open`, or `inventory over bound`. A skipped sweep removes nothing, and
+  the server still starts. No line names an object, a path, or a database identifier.
+- **Failures.** When the stored references cannot all be read, the server removes nothing and exits
+  nonzero with `document store references`. The other startup failures of this step are
+  `document store root`, `document store exclusivity` (the locks or the lease connection failed, or
+  shared locks were not obtained within 10 seconds), `document store inventory`, and
+  `document store sweep`.
 
 ### Database roles
 

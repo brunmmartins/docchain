@@ -77,3 +77,8 @@ required-features = ["test-support"]
 name = "least_privilege"
 path = "../../tests/system/least_privilege.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "orphan_sweep"
+path = "../../tests/system/orphan_sweep.rs"
+required-features = ["test-support"]

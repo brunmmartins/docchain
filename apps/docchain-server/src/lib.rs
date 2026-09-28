@@ -13,6 +13,8 @@ mod store;
 
 pub use docchain_application::{Actor, Credential, SendCopyCommand};
 #[cfg(feature = "test-support")]
-pub use harness::{DatabaseFixture, DemoHarness, StateStats};
+pub use harness::{DatabaseFixture, DemoHarness, StartOptions, StateStats};
 pub use harness::{DocchainService, ServiceError};
 pub use http::{HttpConfig, router};
+#[cfg(feature = "test-support")]
+pub use store::{PauseGate, ScanFault, SweepBounds};
