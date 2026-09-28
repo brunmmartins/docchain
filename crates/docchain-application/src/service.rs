@@ -7,9 +7,10 @@
 use std::{collections::BTreeMap, fmt::Write as _};
 
 use docchain_domain::{
-    AuditExportManifest, CompiledSchema, EventDraft, EventKind, ExchangeId, IdempotencyKey,
-    ObjectId, WalletId, acceptance_eligibility_key, envelope_commitment, event_signature_input,
-    parse_document, reconcile_credits, sha256, verify_event_chain,
+    AuditEvent, AuditExportManifest, AuditSnapshot, Checkpoint, CompiledSchema, EventDraft,
+    EventKind, ExchangeId, IdempotencyKey, ObjectId, WalletId, acceptance_eligibility_key,
+    envelope_commitment, event_signature_input, parse_document, reconcile_credits, sha256,
+    verify_event_chain,
 };
 
 use crate::{
@@ -19,10 +20,11 @@ use crate::{
     model::AuditExportKind,
     ports::{
         AcceptanceOutcome, Adapters, AuditEventStore as _, AuditReadError, AuditReadRequest,
-        Clock as _, CreditPosting, CryptoError, DocumentStore as _, EnvelopeCryptography as _,
-        EventIntegrity as _, ExchangeRecord, ExchangeStore as _, HeaderKey, Identity as _,
-        IdentityError, KeyPurpose, KeyRegistry as _, KeyRegistryError, OpenRequest,
-        SchemaRegistry as _, SchemaRegistryError, SealRequest, StoreError, VerifiedBinding,
+        AuditStoredPage, Clock as _, CreditPosting, CryptoError, DocumentStore as _,
+        EnvelopeCryptography as _, EventIntegrity as _, ExchangeRecord, ExchangeStore as _,
+        HeaderKey, Identity as _, IdentityError, KeyPurpose, KeyRegistry as _, KeyRegistryError,
+        OpenRequest, SchemaRegistry as _, SchemaRegistryError, SealRequest, StoreError,
+        VerifiedBinding,
     },
 };
 
@@ -523,9 +525,11 @@ impl<A: Adapters> Application<A> {
     /// access; [`ApplicationError::InvalidRequest`] for a manifest that is not signed by the
     /// pinned key; [`ApplicationError::AuditIncomplete`] for a snapshot beyond the configured
     /// total, with no page; [`ApplicationError::IntegrityFailure`] for a changed snapshot, a
-    /// selected head whose signature fails before any manifest is signed, or a stored event that
-    /// fails its hash, link, or signature; [`ApplicationError::Unavailable`]
-    /// when the store fails.
+    /// selected head whose signature fails or whose stored hash does not recompute from that
+    /// head event's own preimage, or a stored event that fails its hash, link, or signature;
+    /// [`ApplicationError::Unavailable`] when the store fails, including while a start reads
+    /// the head. A start signs its manifest only after every one of these checks on the head
+    /// and on the first page has passed, so a failed start signs nothing.
     pub async fn export_audit_events(
         &self,
         actor: &Actor,
@@ -535,7 +539,7 @@ impl<A: Adapters> Application<A> {
             return Err(ApplicationError::Forbidden);
         }
         let limit = request.page_size(self.audit.default_page_size());
-        let (manifest, signature, after_sequence, stored) = match request.kind {
+        let (manifest, signature, page) = match request.kind {
             AuditExportKind::Start { challenge } => {
                 let stored = self
                     .adapters
@@ -561,17 +565,24 @@ impl<A: Adapters> Application<A> {
                 {
                     return Err(ApplicationError::IntegrityFailure);
                 }
+                if let Some(head) = stored.snapshot.head()
+                    && stored.events.last().map(|event| event.sequence) != Some(head.sequence)
+                {
+                    self.check_head_preimage(stored.snapshot, head).await?;
+                }
+                let snapshot = stored.snapshot;
+                let page = self.validate_page(snapshot, stored, 0, limit)?;
                 let manifest = AuditExportManifest::new(
                     challenge,
                     self.audit.public_key().fingerprint().as_bytes(),
-                    stored.snapshot,
+                    snapshot,
                 );
                 let signature = self
                     .adapters
                     .integrity()
                     .sign(&manifest.signature_input_v1())
                     .map_err(|_| ApplicationError::Invariant)?;
-                (manifest, signature, 0, stored)
+                (manifest, signature, page)
             }
             AuditExportKind::Continue {
                 manifest,
@@ -602,21 +613,73 @@ impl<A: Adapters> Application<A> {
                     })
                     .await
                     .map_err(audit_read_error)?;
-                (manifest, manifest_signature, after_sequence, stored)
+                let page =
+                    self.validate_page(manifest.snapshot(), stored, after_sequence, limit)?;
+                (manifest, manifest_signature, page)
             }
         };
-        self.export_page(manifest, signature, after_sequence, limit, stored)
+        Ok(AuditExportPage {
+            manifest,
+            manifest_signature: signature,
+            coverage: page.coverage,
+            events: page.events,
+            next_after_sequence: page.next_after_sequence,
+        })
     }
 
-    fn export_page(
+    /// Proves that the selected head's stored hash recomputes from that head event's own
+    /// preimage, for a first page that stops before the head. The head's signature is already
+    /// verified, but the store could pair it with a hash taken from another sequence; the
+    /// preimage binds the sequence, so a recomputing row at the head's own checkpoint cannot
+    /// be such a moved hash.
+    ///
+    /// The head event is read only to recompute its hash and is then dropped.
+    async fn check_head_preimage(
         &self,
-        manifest: AuditExportManifest,
-        manifest_signature: [u8; 64],
+        selected: AuditSnapshot,
+        head: Checkpoint,
+    ) -> Result<(), ApplicationError> {
+        let read = self
+            .adapters
+            .audit_events()
+            .page(AuditReadRequest {
+                snapshot: Some(selected),
+                after_sequence: head
+                    .sequence
+                    .checked_sub(1)
+                    .ok_or(ApplicationError::IntegrityFailure)?,
+                limit: 1,
+            })
+            .await
+            .map_err(audit_read_error)?;
+        let AuditStoredPage {
+            snapshot,
+            events,
+            has_more,
+        } = read;
+        let [event] =
+            <[AuditEvent; 1]>::try_from(events).map_err(|_| ApplicationError::IntegrityFailure)?;
+        if snapshot != selected
+            || has_more
+            || event.sequence != head.sequence
+            || event.checkpoint() != head
+        {
+            return Err(ApplicationError::IntegrityFailure);
+        }
+        AuditExportEvent::from_stored(event)?;
+        Ok(())
+    }
+
+    /// Checks one stored page against the snapshot it must belong to, and converts it into
+    /// exported proofs with its coverage markers. Nothing is signed here, so a start can run
+    /// every check before its manifest is signed.
+    fn validate_page(
+        &self,
+        snapshot: AuditSnapshot,
+        stored: AuditStoredPage,
         after_sequence: u64,
         limit: u32,
-        stored: crate::AuditStoredPage,
-    ) -> Result<AuditExportPage, ApplicationError> {
-        let snapshot = manifest.snapshot();
+    ) -> Result<ValidatedPage, ApplicationError> {
         if stored.snapshot != snapshot
             || stored.events.len()
                 > usize::try_from(limit).map_err(|_| ApplicationError::Invariant)?
@@ -658,9 +721,7 @@ impl<A: Adapters> Application<A> {
             stored.has_more,
             limit,
         )?;
-        Ok(AuditExportPage {
-            manifest,
-            manifest_signature,
+        Ok(ValidatedPage {
             coverage,
             events: proof,
             next_after_sequence,
@@ -850,6 +911,14 @@ impl<A: Adapters> Application<A> {
             let _ = self.adapters.documents().remove(object_id).await;
         }
     }
+}
+
+/// A stored export page whose every event and marker has been checked, not yet bound to a
+/// signed manifest.
+struct ValidatedPage {
+    coverage: Coverage,
+    events: Vec<AuditExportEvent>,
+    next_after_sequence: Option<u64>,
 }
 
 fn page_markers(

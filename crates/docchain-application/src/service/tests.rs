@@ -92,6 +92,12 @@ struct Fake {
     credit_snapshot_error: Mutex<Option<AuditReadError>>,
     /// The snapshot every audit page read was asked to continue, in order.
     page_snapshots: Mutex<Vec<Option<AuditSnapshot>>>,
+    /// A failure the next page read that names a snapshot returns. A read selecting the
+    /// current snapshot never consumes it.
+    snapshot_read_error: Mutex<Option<AuditReadError>>,
+    /// A page the next page read that names a snapshot returns instead of the stored rows,
+    /// standing in for a store that answers two reads inconsistently.
+    snapshot_read_page: Mutex<Option<AuditStoredPage>>,
     /// Audit-store calls of either operation.
     audit_reads: AtomicUsize,
 }
@@ -152,6 +158,8 @@ impl Fake {
             ledger: Mutex::new(None),
             credit_snapshot_error: Mutex::new(None),
             page_snapshots: Mutex::new(Vec::new()),
+            snapshot_read_error: Mutex::new(None),
+            snapshot_read_page: Mutex::new(None),
             audit_reads: AtomicUsize::new(0),
         }
     }
@@ -639,6 +647,24 @@ impl AuditEventStore for Fake {
             .lock()
             .expect("page snapshots")
             .push(request.snapshot);
+        if request.snapshot.is_some() {
+            if let Some(error) = self
+                .snapshot_read_error
+                .lock()
+                .expect("snapshot read error")
+                .take()
+            {
+                return Err(error);
+            }
+            if let Some(page) = self
+                .snapshot_read_page
+                .lock()
+                .expect("snapshot read page")
+                .take()
+            {
+                return Ok(page);
+            }
+        }
         let events = self.events.lock().expect("events");
         let selected = AuditSnapshot::new(
             u64::try_from(events.len()).map_err(|_| AuditReadError::Invariant)?,
@@ -1852,6 +1878,297 @@ fn audit_export_partition_boundaries_cover_each_sequence_once() {
         page_markers(2, 1, 1, false, 1),
         Err(ApplicationError::IntegrityFailure)
     );
+}
+
+/// An application whose chain holds `count` events appended straight into the fake store, each
+/// recording the same valid draft.
+fn seeded(count: usize) -> Application<Fakes> {
+    let source = application();
+    block_on(source.send_copy(&actor(SENDER), command())).expect("delivery");
+    let draft = fake(&source).events.lock().expect("events")[0]
+        .draft
+        .clone();
+    let application = application();
+    let state = fake(&application);
+    for _ in 0..count {
+        state.append(draft.clone(), state).expect("append");
+    }
+    application
+}
+
+/// The snapshot the fake's current chain names.
+fn current_snapshot(state: &Fake) -> AuditSnapshot {
+    let events = state.events.lock().expect("events");
+    AuditSnapshot::new(
+        u64::try_from(events.len()).expect("small chain"),
+        events.last().map(AuditEvent::checkpoint),
+    )
+    .expect("valid snapshot")
+}
+
+fn start_export(
+    application: &Application<Fakes>,
+    limit: u32,
+) -> Result<AuditExportPage, ApplicationError> {
+    block_on(application.export_audit_events(&Actor::Auditor, start(5, Some(limit))))
+}
+
+#[test]
+fn audit_export_start_over_misplaced_signed_head_fails_and_signs_nothing() {
+    // With one event per page only the start's own head check sees the head row; with 500 the
+    // first page holds it, and its checks must still run before the manifest is signed.
+    for limit in [1, 500] {
+        let application = seeded(2);
+        let state = fake(&application);
+        {
+            let mut events = state.events.lock().expect("events");
+            // The head row carries event 1's hash and that hash's valid signature, so the head
+            // signature verifies but the hash does not belong to sequence 2.
+            events[1].event_hash = events[0].event_hash;
+            events[1].signature = events[0].signature;
+        }
+        let signed_before = state.signatures.load(Ordering::SeqCst);
+        assert_eq!(
+            start_export(&application, limit),
+            Err(ApplicationError::IntegrityFailure),
+            "{limit}"
+        );
+        assert_eq!(
+            state.signatures.load(Ordering::SeqCst),
+            signed_before,
+            "{limit}"
+        );
+    }
+}
+
+#[test]
+fn audit_export_start_signs_one_manifest_for_untampered_chains() {
+    for count in [0_usize, 1, 2] {
+        for limit in [1_u32, 500] {
+            let application = seeded(count);
+            let state = fake(&application);
+            let selected = current_snapshot(state);
+            let signed_before = state.signatures.load(Ordering::SeqCst);
+            let page = start_export(&application, limit).expect("start page");
+            assert_eq!(
+                state.signatures.load(Ordering::SeqCst),
+                signed_before + 1,
+                "{count}/{limit}"
+            );
+            assert_eq!(page.manifest.snapshot(), selected, "{count}/{limit}");
+            assert!(
+                state
+                    .verify(
+                        &page.manifest.signature_input_v1(),
+                        &page.manifest_signature
+                    )
+                    .is_ok()
+            );
+            let returned = count.min(usize::try_from(limit).expect("small limit"));
+            let last = u64::try_from(returned).expect("small page");
+            assert_eq!(
+                page.events
+                    .iter()
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                (1..=last).collect::<Vec<_>>(),
+                "{count}/{limit}"
+            );
+            let stops_before_head = returned < count;
+            let (coverage, cursor, reads) = if stops_before_head {
+                (Coverage::Partial, Some(last), vec![None, Some(selected)])
+            } else {
+                (Coverage::Complete, None, vec![None])
+            };
+            assert_eq!(
+                (page.coverage, page.next_after_sequence),
+                (coverage, cursor),
+                "{count}/{limit}"
+            );
+            assert_eq!(
+                *state.page_snapshots.lock().expect("pages"),
+                reads,
+                "{count}/{limit}"
+            );
+        }
+    }
+}
+
+#[test]
+fn audit_export_start_fails_closed_when_the_head_read_fails_and_signs_nothing() {
+    for (error, expected) in [
+        (AuditReadError::Transient, ApplicationError::Unavailable),
+        (AuditReadError::Permanent, ApplicationError::Unavailable),
+        (
+            AuditReadError::SnapshotChanged,
+            ApplicationError::IntegrityFailure,
+        ),
+        (
+            AuditReadError::Invariant,
+            ApplicationError::IntegrityFailure,
+        ),
+    ] {
+        let application = seeded(2);
+        let state = fake(&application);
+        let selected = current_snapshot(state);
+        // Queued for the snapshot-naming read only, so the first read cannot absorb it.
+        *state
+            .snapshot_read_error
+            .lock()
+            .expect("snapshot read error") = Some(error);
+        let signed_before = state.signatures.load(Ordering::SeqCst);
+        assert_eq!(start_export(&application, 1), Err(expected), "{error:?}");
+        assert_eq!(
+            state.signatures.load(Ordering::SeqCst),
+            signed_before,
+            "{error:?}"
+        );
+        assert_eq!(
+            *state.page_snapshots.lock().expect("pages"),
+            vec![None, Some(selected)],
+            "{error:?}"
+        );
+        assert!(
+            state
+                .snapshot_read_error
+                .lock()
+                .expect("snapshot read error")
+                .is_none(),
+            "the head read returned the queued failure"
+        );
+    }
+}
+
+#[test]
+fn audit_export_start_refuses_a_head_read_other_than_the_signed_head_and_signs_nothing() {
+    let application = seeded(2);
+    let state = fake(&application);
+    let stored = state.events.lock().expect("events").clone();
+    let selected = current_snapshot(state);
+    let earlier = AuditSnapshot::new(1, Some(stored[0].checkpoint())).expect("snapshot");
+    // Another event, validly hashed and signed at the head's own sequence and link.
+    let mut draft = stored[1].draft.clone();
+    draft.document_version = DocumentVersion::new(9).expect("version");
+    let hash = AuditEvent::hash_for(&draft, 2, &stored[0].event_hash).expect("hash");
+    let rival = AuditEvent::assemble(
+        draft,
+        2,
+        stored[0].event_hash,
+        fake_signature(&event_signature_input(&hash)),
+    )
+    .expect("rival event");
+    assert!(AuditExportEvent::from_stored(rival.clone()).is_ok());
+    let answer = |snapshot, events, has_more| AuditStoredPage {
+        snapshot,
+        events,
+        has_more,
+    };
+    let head = || stored[1].clone();
+    let first = || stored[0].clone();
+    for (case, page) in [
+        (
+            "another valid event at the head's sequence",
+            answer(selected, vec![rival], false),
+        ),
+        (
+            "a valid event at another sequence",
+            answer(selected, vec![first()], false),
+        ),
+        ("no event", answer(selected, vec![], false)),
+        (
+            "the head, then another event",
+            answer(selected, vec![head(), first()], false),
+        ),
+        (
+            "another event, then the head",
+            answer(selected, vec![first(), head()], false),
+        ),
+        (
+            "the head, claiming more events",
+            answer(selected, vec![head()], true),
+        ),
+        (
+            "the head, under another snapshot",
+            answer(earlier, vec![head()], false),
+        ),
+    ] {
+        state.page_snapshots.lock().expect("pages").clear();
+        *state.snapshot_read_page.lock().expect("snapshot read page") = Some(page);
+        let signed_before = state.signatures.load(Ordering::SeqCst);
+        assert_eq!(
+            start_export(&application, 1),
+            Err(ApplicationError::IntegrityFailure),
+            "{case}"
+        );
+        assert_eq!(
+            state.signatures.load(Ordering::SeqCst),
+            signed_before,
+            "{case}"
+        );
+        assert_eq!(
+            *state.page_snapshots.lock().expect("pages"),
+            vec![None, Some(selected)],
+            "{case}"
+        );
+    }
+
+    // The same queued answer holding exactly the signed head is accepted, so each refusal
+    // above comes from its own defect.
+    *state.snapshot_read_page.lock().expect("snapshot read page") =
+        Some(answer(selected, vec![head()], false));
+    let signed_before = state.signatures.load(Ordering::SeqCst);
+    assert!(start_export(&application, 1).is_ok());
+    assert_eq!(state.signatures.load(Ordering::SeqCst), signed_before + 1);
+}
+
+#[test]
+fn audit_export_use_case_pages_cover_each_sequence_once() {
+    for count in [0_usize, 1, 499, 500, 501] {
+        let application = seeded(count);
+        let state = fake(&application);
+        let total = u64::try_from(count).expect("small chain");
+        for limit in [1_u32, 100, 500] {
+            let signed_before = state.signatures.load(Ordering::SeqCst);
+            let mut page = start_export(&application, limit).expect("start page");
+            let (manifest, signature) = (page.manifest, page.manifest_signature);
+            let mut covered = Vec::new();
+            let mut pages = 1_usize;
+            loop {
+                assert_eq!(
+                    (page.manifest, page.manifest_signature),
+                    (manifest, signature),
+                    "{count}/{limit}"
+                );
+                covered.extend(page.events.iter().map(|event| event.sequence));
+                match (page.coverage, page.next_after_sequence) {
+                    (Coverage::Partial, Some(cursor)) => {
+                        assert_eq!(
+                            page.events.last().map(|event| event.sequence),
+                            Some(cursor),
+                            "{count}/{limit}"
+                        );
+                        page = next_page(&application, &page, Some(limit)).expect("next page");
+                        pages += 1;
+                    }
+                    (Coverage::Complete, None) => break,
+                    markers => panic!("invalid markers at {count}/{limit}: {markers:?}"),
+                }
+            }
+            assert_eq!(covered, (1..=total).collect::<Vec<_>>(), "{count}/{limit}");
+            assert_eq!(
+                pages,
+                count
+                    .div_ceil(usize::try_from(limit).expect("small limit"))
+                    .max(1),
+                "{count}/{limit}"
+            );
+            assert_eq!(
+                state.signatures.load(Ordering::SeqCst),
+                signed_before + 1,
+                "{count}/{limit}"
+            );
+        }
+    }
 }
 
 #[test]
