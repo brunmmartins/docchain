@@ -127,9 +127,10 @@ timestamp: the collector that reads standard output stamps each line.
 
 Records are best-effort and are not an audit trail. They pass through a queue of 4,096 records to one
 writer thread, a full queue drops a record instead of delaying a request, and the process waits at
-most one second at exit for queued records. Records hold no identifier, but a reader who also holds
-the event chain can link them to activity by the collector's timestamps, so treat standard output as
-pseudonymous activity metadata.
+most one second at exit for queued records. A write that standard output refuses, in whole or in
+part, loses that record, and it is never retried. Records hold no identifier, but a reader who also
+holds the event chain can link them to activity by the collector's timestamps, so treat standard
+output as pseudonymous activity metadata.
 
 `GET /operations/counters` returns exact per-process counts for the operator credential only, behind
 the same admission limit and deadline as the API, with `Cache-Control: no-store`:
@@ -139,8 +140,10 @@ the same admission limit and deadline as the API, with `Cache-Control: no-store`
 ```
 
 `counters` lists only nonzero operation and outcome pairs; `dropped_records` counts records lost from
-the queue. Counts restart at zero with the process, and a read does not count itself. A missing or
-unknown credential gets `401`, any other role `403`, and a query or a body `422`.
+the queue or refused by standard output, for example once the collector's pipe closes. Records still
+queued when the exit flush ends are not counted. Counts restart at zero with the process, and a read
+does not count itself. A missing or unknown credential gets `401`, any other role `403`, and a query
+or a body `422`.
 
 Every API request carries `Authorization: Bearer <credential>`, verified against the configured
 credential file; no other header selects a wallet or role.

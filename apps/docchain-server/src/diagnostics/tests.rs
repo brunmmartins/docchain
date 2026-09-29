@@ -21,12 +21,70 @@ impl Write for Memory {
 }
 
 impl Memory {
+    fn bytes(&self) -> Vec<u8> {
+        self.0.lock().expect("memory").clone()
+    }
+
     fn lines(&self) -> Vec<Value> {
         String::from_utf8(self.0.lock().expect("memory").clone())
             .expect("UTF-8")
             .lines()
             .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
             .collect()
+    }
+}
+
+/// A writer that refuses every write with `kind`, and whose flush fails the same way.
+struct Refusing(std::io::ErrorKind);
+
+impl Write for Refusing {
+    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+        Err(self.0.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(self.0.into())
+    }
+}
+
+/// A writer that takes `remaining` bytes in total into `memory`, then refuses with `WouldBlock`.
+struct Partial {
+    memory: Memory,
+    remaining: usize,
+}
+
+impl Write for Partial {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        let taken = self.remaining.min(bytes.len());
+        self.remaining -= taken;
+        self.memory.write(&bytes[..taken])
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    }
+}
+
+/// A writer whose first write fails with `BrokenPipe`, and whose later writes reach `memory`.
+struct FailsFirst {
+    memory: Memory,
+    failed: bool,
+}
+
+impl Write for FailsFirst {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if !self.failed {
+            self.failed = true;
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        self.memory.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -39,7 +97,11 @@ fn recording() -> (Diagnostics, Memory) {
 fn stalled(capacity: usize) -> (Diagnostics, Receiver<Record>) {
     let (sender, receiver) = mpsc::sync_channel(capacity);
     (
-        Diagnostics::with_output(Output::Queue(sender), Arc::default()),
+        Diagnostics::with_output(
+            Output::Queue(sender),
+            Arc::default(),
+            Arc::new(Counters::new()),
+        ),
         receiver,
     )
 }
@@ -516,6 +578,89 @@ fn a_closed_queue_drops_and_counts_every_record() {
     diagnostics.startup_failed(StartupFailure::at(StartupStep::HttpListener));
     assert_eq!(dropped(&diagnostics), 2);
     assert_eq!(cells(&diagnostics), [(Operation::Ready, Outcome::Ok, 1)]);
+}
+
+#[test]
+fn a_refused_write_counts_each_lost_record_and_leaves_cells_exact() {
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::WouldBlock,
+    ] {
+        let diagnostics = Diagnostics::spawn(QUEUE_CAPACITY, Refusing(kind));
+        for _ in 0..5 {
+            diagnostics.open_request(Operation::Live).close(Outcome::Ok);
+        }
+        let limit = Duration::from_secs(5);
+        let started = Instant::now();
+        assert!(
+            !diagnostics.flush(limit),
+            "{kind:?}: a refused record is not written"
+        );
+        assert!(
+            started.elapsed() < limit,
+            "{kind:?}: settles within the limit"
+        );
+        assert_eq!(dropped(&diagnostics), 5, "{kind:?}");
+        assert_eq!(
+            cells(&diagnostics),
+            [(Operation::Live, Outcome::Ok, 5)],
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn a_partial_write_is_lost_not_written() {
+    let memory = Memory::default();
+    let diagnostics = Diagnostics::spawn(
+        QUEUE_CAPACITY,
+        Partial {
+            memory: memory.clone(),
+            remaining: 10,
+        },
+    );
+    diagnostics.open_request(Operation::Live).close(Outcome::Ok);
+    let limit = Duration::from_secs(5);
+    let started = Instant::now();
+    assert!(!diagnostics.flush(limit));
+    assert!(started.elapsed() < limit);
+    assert_eq!(dropped(&diagnostics), 1);
+    assert_eq!(cells(&diagnostics), [(Operation::Live, Outcome::Ok, 1)]);
+    // Only the fragment reached the output: no retry and no repair bytes.
+    assert_eq!(memory.bytes(), b"{\"record\":");
+}
+
+#[test]
+fn flush_is_true_only_while_every_queued_record_was_written() {
+    let memory = Memory::default();
+    let diagnostics = Diagnostics::spawn(
+        QUEUE_CAPACITY,
+        FailsFirst {
+            memory: memory.clone(),
+            failed: false,
+        },
+    );
+    diagnostics.open_request(Operation::Live).close(Outcome::Ok);
+    assert!(!diagnostics.flush(Duration::from_secs(5)));
+    assert_eq!(dropped(&diagnostics), 1);
+    diagnostics.open_request(Operation::Live).close(Outcome::Ok);
+    diagnostics.open_request(Operation::Live).close(Outcome::Ok);
+    // Later writes succeed, but a flush never again reports every record written.
+    assert!(!diagnostics.flush(Duration::from_secs(5)));
+    let lines = memory.lines();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| (&line["record"], &line["request_id"]))
+            .collect::<Vec<_>>(),
+        [
+            (&Value::from("request"), &Value::from(2)),
+            (&Value::from("request"), &Value::from(3)),
+        ]
+    );
+    assert_eq!(dropped(&diagnostics), 1);
+    assert_eq!(cells(&diagnostics), [(Operation::Live, Outcome::Ok, 3)]);
 }
 
 #[test]

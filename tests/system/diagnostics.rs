@@ -1466,3 +1466,89 @@ async fn server_streams_hold_only_closed_records() {
     values.push(root.display().to_string());
     assert_excludes(&format!("{stdout}\n{stderr}"), &values);
 }
+
+/// Reads `dropped_records` as the operator, asserting the read succeeds.
+async fn dropped_records(address: SocketAddr, harness: &DemoHarness) -> u64 {
+    let reply = send(
+        address,
+        &get(
+            "/operations/counters",
+            &bearer(&harness.operator_credential),
+        ),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    reply.json()["dropped_records"]
+        .as_u64()
+        .expect("dropped_records")
+}
+
+#[tokio::test]
+async fn a_closed_standard_output_counts_lost_records_and_keeps_serving() {
+    let harness = DemoHarness::new().await.expect("harness");
+    let address = free_address();
+    let mut child = spawn(&harness.server_environment(), address);
+    let stderr = drain(child.stderr.take());
+    // Standard output stays unread until ready; the pipe holds far more than readiness writes.
+    let started = Instant::now();
+    while ready(address).await != Some(204) {
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "server exited before ready"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "server not ready"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(dropped_records(address, &harness).await, 0);
+
+    // The test holds the only read end, so closing it leaves every later write refused.
+    drop(child.stdout.take());
+    for _ in 0..3 {
+        assert_eq!(send(address, &get("/health/live", "")).await.status, 204);
+    }
+    let started = Instant::now();
+    let dropped = loop {
+        let dropped = dropped_records(address, &harness).await;
+        if dropped > 0 {
+            break dropped;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "refused writes were never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(send(address, &get("/health/live", "")).await.status, 204);
+    assert!(dropped_records(address, &harness).await >= dropped);
+
+    let status = Command::new("kill")
+        .args(["-s", "TERM", &child.id().to_string()])
+        .status()
+        .expect("kill utility");
+    assert!(status.success());
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("process status") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "process did not exit"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let stderr = stderr.join().expect("stderr");
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    // Standard error holds exactly the sweep report line: no panic line.
+    let human: Vec<&str> = stderr.lines().collect();
+    assert_eq!(human.len(), 1, "{stderr}");
+    assert!(human[0].starts_with("docchain-server: "), "{stderr}");
+}

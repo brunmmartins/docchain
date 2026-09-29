@@ -4,10 +4,13 @@
 //! Every record is one JSON object per line on standard output. Each record field is a field-less
 //! enum or an integer, so no request data, identifier, path, key, secret, or free text can reach a
 //! record by any path. Requests never block or wait on diagnostics: a record goes through a bounded
-//! queue to one writer thread, and a full or closed queue drops it and counts the drop.
+//! queue to one writer thread. A full or closed queue drops the record and counts the drop, and so
+//! does a write that standard output refuses in whole or in part. A refused record is never
+//! retried.
 //!
 //! Records are best-effort activity metadata, not an audit trail. The counters and the
 //! dropped-record count are updated directly, never through the queue, so they stay exact.
+//! Records still queued when the exit flush ends are lost without being counted.
 
 use std::{
     future::Future,
@@ -487,42 +490,61 @@ struct CounterEntry {
 
 /// Where records go.
 enum Output {
-    /// The writer thread's queue. A full or disconnected queue drops the record and counts it.
+    /// The writer thread's queue. A full or disconnected queue drops the record and counts it,
+    /// and the writer counts every record its output refuses in whole or in part.
     Queue(SyncSender<Record>),
     /// Nowhere, and nothing is counted as dropped: the handle writes no records at all.
     Discard,
 }
 
-/// How many records were queued and written, so the exit flush can wait for the writer.
+/// How many records were queued, and how many of them the writer settled: written in full, or
+/// lost because the output refused them in whole or in part. The exit flush waits on it.
 #[derive(Default)]
 struct Progress {
     queued: AtomicU64,
-    written: Mutex<u64>,
+    settled: Mutex<Settled>,
     advanced: Condvar,
 }
 
+/// Records the writer has taken from the queue, by result. Both counts only grow.
+#[derive(Clone, Copy, Default)]
+struct Settled {
+    written: u64,
+    lost: u64,
+}
+
+impl Settled {
+    fn total(self) -> u64 {
+        self.written.saturating_add(self.lost)
+    }
+}
+
 impl Progress {
-    fn advance(&self, records: u64) {
-        let mut written = self.written.lock().unwrap_or_else(PoisonError::into_inner);
-        *written = written.saturating_add(records);
+    /// Adds a batch's results. The writer counts each lost record as dropped before calling this,
+    /// so a flush that returns has seen every count for the records it waited on.
+    fn advance(&self, written: u64, lost: u64) {
+        let mut settled = self.settled.lock().unwrap_or_else(PoisonError::into_inner);
+        settled.written = settled.written.saturating_add(written);
+        settled.lost = settled.lost.saturating_add(lost);
         self.advanced.notify_all();
     }
 
-    /// Waits until every record queued so far is written, or `limit` passes.
+    /// Waits until every record queued so far is settled, or `limit` passes. Returns whether
+    /// every one of them was written in full and no record was ever lost by the output.
     fn wait(&self, limit: Duration) -> bool {
         let target = self.queued.load(Ordering::Acquire);
-        let written = self.written.lock().unwrap_or_else(PoisonError::into_inner);
-        let (written, _) = self
+        let settled = self.settled.lock().unwrap_or_else(PoisonError::into_inner);
+        let (settled, _) = self
             .advanced
-            .wait_timeout_while(written, limit, |written| *written < target)
+            .wait_timeout_while(settled, limit, |settled| settled.total() < target)
             .unwrap_or_else(PoisonError::into_inner);
-        *written >= target
+        settled.lost == 0 && settled.written >= target
     }
 }
 
 struct Shared {
     output: Output,
-    counters: Counters,
+    counters: Arc<Counters>,
     next_request_id: AtomicU64,
     progress: Arc<Progress>,
 }
@@ -540,7 +562,9 @@ impl Diagnostics {
     /// Starts the `docchain-diagnostics` writer thread, which writes records to standard output.
     ///
     /// Span records are on until [`Diagnostics::with_spans`] turns them off. When the thread
-    /// cannot start, every record is dropped and counted, and the handle still works.
+    /// cannot start, every record is dropped and counted, and the handle still works. A record
+    /// that standard output refuses in whole or in part is dropped and counted too, and is never
+    /// retried.
     #[must_use]
     pub fn start() -> Self {
         Self::spawn(QUEUE_CAPACITY, std::io::stdout())
@@ -549,7 +573,7 @@ impl Diagnostics {
     /// A handle that writes no record. Counters still count.
     #[must_use]
     pub fn discarding() -> Self {
-        Self::with_output(Output::Discard, Arc::default())
+        Self::with_output(Output::Discard, Arc::default(), Arc::new(Counters::new()))
     }
 
     /// A handle that writes records to a buffer, for tests. Records are written through the
@@ -569,19 +593,22 @@ impl Diagnostics {
     fn spawn<W: Write + Send + 'static>(capacity: usize, output: W) -> Self {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         let progress = Arc::<Progress>::default();
+        let counters = Arc::new(Counters::new());
+        // The writer holds neither the sender nor `Shared`, so it ends once every handle is gone.
         let writer_progress = Arc::clone(&progress);
+        let writer_counters = Arc::clone(&counters);
         // A failed spawn drops the receiver, so every later record is dropped and counted.
         let _detached = thread::Builder::new()
             .name("docchain-diagnostics".to_owned())
-            .spawn(move || write_records(&receiver, output, &writer_progress));
-        Self::with_output(Output::Queue(sender), progress)
+            .spawn(move || write_records(&receiver, output, &writer_progress, &writer_counters));
+        Self::with_output(Output::Queue(sender), progress, counters)
     }
 
-    fn with_output(output: Output, progress: Arc<Progress>) -> Self {
+    fn with_output(output: Output, progress: Arc<Progress>, counters: Arc<Counters>) -> Self {
         Self {
             shared: Arc::new(Shared {
                 output,
-                counters: Counters::new(),
+                counters,
                 next_request_id: AtomicU64::new(1),
                 progress,
             }),
@@ -608,8 +635,9 @@ impl Diagnostics {
         self.emit(Record::StartupFailed(failure));
     }
 
-    /// Waits until every record queued so far is written, or `limit` passes. Returns whether
-    /// all of them were written.
+    /// Waits until the writer has settled every record queued so far, or `limit` passes.
+    /// Returns `true` only when every one of them was written in full, and no record was ever
+    /// refused by the output: once a write is refused, every later flush returns `false`.
     ///
     /// # Blocking
     ///
@@ -650,29 +678,65 @@ impl Diagnostics {
 }
 
 /// Serializes each queued record as one line until every sender is gone.
-fn write_records<W: Write>(receiver: &Receiver<Record>, mut output: W, progress: &Progress) {
+///
+/// A record the output refuses, in whole or in part, is lost: it is counted as dropped and never
+/// retried, and no repair bytes follow a partial line. The operation × outcome cells are not
+/// touched here.
+fn write_records<W: Write>(
+    receiver: &Receiver<Record>,
+    mut output: W,
+    progress: &Progress,
+    counters: &Counters,
+) {
     while let Ok(record) = receiver.recv() {
-        write_line(&mut output, &record);
-        let mut written = 1;
-        while written < WRITE_BATCH {
+        let mut batch = Batch::default();
+        batch.settle(write_line(&mut output, &record), counters);
+        while batch.taken() < WRITE_BATCH {
             let Ok(record) = receiver.try_recv() else {
                 break;
             };
-            write_line(&mut output, &record);
-            written += 1;
+            batch.settle(write_line(&mut output, &record), counters);
         }
-        // A failed write loses only best-effort records; the counters are unaffected.
+        // Each record's `write_all` already reached the descriptor, because a line ending in a
+        // newline is never held in standard output's buffer, so this result reports nothing new.
         let _ = output.flush();
-        progress.advance(written);
+        progress.advance(batch.written, batch.lost);
     }
 }
 
-fn write_line<W: Write>(output: &mut W, record: &Record) {
-    // The record types serialize infallibly: field-less enums, integers, and a tag.
-    if let Ok(mut line) = serde_json::to_vec(record) {
-        line.push(b'\n');
-        let _ = output.write_all(&line);
+/// One batch's results, before they are published to the exit flush.
+#[derive(Default)]
+struct Batch {
+    written: u64,
+    lost: u64,
+}
+
+impl Batch {
+    fn taken(&self) -> u64 {
+        self.written.saturating_add(self.lost)
     }
+
+    /// Counts a lost record as dropped at once, so the count precedes the batch's progress.
+    fn settle(&mut self, written: bool, counters: &Counters) {
+        if written {
+            self.written = self.written.saturating_add(1);
+        } else {
+            counters.record_drop();
+            self.lost = self.lost.saturating_add(1);
+        }
+    }
+}
+
+/// Writes `record` as one line, and returns whether the whole line was written.
+#[must_use]
+fn write_line<W: Write>(output: &mut W, record: &Record) -> bool {
+    // The record types serialize infallibly: field-less enums, integers, and a tag. A failure
+    // would still lose the record, so it counts as one.
+    let Ok(mut line) = serde_json::to_vec(record) else {
+        return false;
+    };
+    line.push(b'\n');
+    output.write_all(&line).is_ok()
 }
 
 /// Microseconds since `started`, saturating.

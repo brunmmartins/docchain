@@ -1955,6 +1955,37 @@ mod tests {
             }
         }
 
+        /// Longest a migration run may take here, so a leaked migration lock fails by name
+        /// instead of hanging the suite.
+        const MIGRATION_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+        /// Whether the session behind `conn` holds any advisory lock, as SQLx's migration lock is.
+        async fn holds_advisory_lock(conn: &mut PgConnection) -> bool {
+            sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks \
+                 WHERE locktype = 'advisory' AND granted \
+                 AND pid = pg_catalog.pg_backend_pid())",
+            )
+            .fetch_one(conn)
+            .await
+            .expect("advisory locks")
+        }
+
+        /// Asserts that no connection of `pool` holds an advisory lock, holding every connection
+        /// the pool may open at once so each one's own session is checked.
+        async fn assert_no_pooled_advisory_lock(pool: &PgPool) {
+            let mut held = Vec::new();
+            for _ in 0..pool.options().get_max_connections() {
+                held.push(pool.acquire().await.expect("every pool connection"));
+            }
+            for conn in &mut held {
+                assert!(
+                    !holds_advisory_lock(conn).await,
+                    "a pooled connection holds the migration lock"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn an_edited_applied_migration_is_refused() {
             let (_fixture, pool) = migrated().await;
@@ -1963,10 +1994,25 @@ mod tests {
             let edited = Migrator::new(EditedFirstMigration)
                 .await
                 .expect("edited migrations");
+            // A refused run keeps SQLx's session lock, so it runs on one connection that is
+            // closed afterwards rather than returned to the pool.
+            let mut refused = pool.acquire().await.expect("connection");
+            let result = tokio::time::timeout(MIGRATION_BOUND, edited.run(&mut *refused))
+                .await
+                .expect("the edited run ends within its bound");
             assert!(matches!(
-                edited.run(&pool).await,
+                result,
                 Err(sqlx::migrate::MigrateError::VersionMismatch(1))
             ));
+            assert!(
+                holds_advisory_lock(&mut refused).await,
+                "the refused run still holds the migration lock"
+            );
+            refused
+                .close()
+                .await
+                .expect("close the refused migration connection");
+            assert_no_pooled_advisory_lock(&pool).await;
             assert_eq!(recorded(&pool).await, before);
 
             sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 2")
@@ -1975,8 +2021,14 @@ mod tests {
                 .await
                 .expect("tamper with the recorded checksum");
             let tampered = recorded(&pool).await;
-            assert_eq!(migrate(&pool).await, Err(StoreError::Permanent));
+            assert_eq!(
+                tokio::time::timeout(MIGRATION_BOUND, migrate(&pool))
+                    .await
+                    .expect("the tampered run ends within its bound"),
+                Err(StoreError::Permanent)
+            );
             assert_eq!(recorded(&pool).await, tampered);
+            assert_no_pooled_advisory_lock(&pool).await;
         }
 
         #[tokio::test]
