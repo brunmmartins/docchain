@@ -195,6 +195,8 @@ pub struct DocchainService {
     )]
     lease: std::sync::Mutex<Option<StoreLease>>,
     sweep: StoreSweep,
+    #[cfg(feature = "test-support")]
+    sweep_elapsed: std::time::Duration,
 }
 
 impl DocchainService {
@@ -218,6 +220,13 @@ impl DocchainService {
     #[must_use]
     pub const fn sweep_report(&self) -> StoreSweep {
         self.sweep
+    }
+
+    /// Time spent in this service's startup sweep.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn sweep_elapsed(&self) -> std::time::Duration {
+        self.sweep_elapsed
     }
 
     pub(crate) async fn compose_with(
@@ -298,6 +307,8 @@ impl DocchainService {
                 LeaseError::Binding => "document store binding",
             })
         })?;
+        #[cfg(feature = "test-support")]
+        let sweep_started = std::time::Instant::now();
         let sweep = match sweep_debris(permit, &documents, &exchanges).await {
             Ok(sweep) => sweep,
             Err(error) => {
@@ -309,6 +320,8 @@ impl DocchainService {
                 }));
             }
         };
+        #[cfg(feature = "test-support")]
+        let sweep_elapsed = sweep_started.elapsed();
         if lease.downgrade(&bounds).await.is_err() {
             lease.release().await;
             return Err(ServiceError::Initialization("document store exclusivity"));
@@ -327,6 +340,8 @@ impl DocchainService {
             application: Application::new(adapters, limits, audit),
             lease: std::sync::Mutex::new(Some(lease)),
             sweep,
+            #[cfg(feature = "test-support")]
+            sweep_elapsed,
         })
     }
 

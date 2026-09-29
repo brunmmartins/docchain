@@ -681,10 +681,7 @@ impl FileDocumentStore {
         let metadata = fs::symlink_metadata(&root)
             .await
             .map_err(|_| StoreError::Permanent)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(StoreError::Permanent);
-        }
-        let identity = RootIdentity::of(&root)?;
+        let identity = RootIdentity::from_metadata(&metadata)?;
         Ok(Self {
             root,
             identity,

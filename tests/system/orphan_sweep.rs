@@ -7,15 +7,15 @@
 mod support;
 
 use std::{
-    io::Read as _,
+    io::{BufRead as _, Read as _},
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use docchain_application::{StoreSweep, SweepCounts, SweepSkip};
+use docchain_application::{Limits, StoreSweep, SweepCounts, SweepSkip};
 use docchain_domain::{DocumentVersion, IdempotencyKey, ObjectId, RequestNonce, sha256};
 use docchain_server::{
     Credential, DemoHarness, DocchainService, ScanFault, SendCopyCommand, ServiceError,
@@ -55,10 +55,12 @@ fn plant_temporary(root: &Path) -> PathBuf {
 }
 
 /// The `n`th distinct valid send from the sender to the recipient.
-fn request(n: u8) -> SendCopyCommand {
+fn request(n: u64) -> SendCopyCommand {
     let mut command = support::valid_request();
-    command.document_version = DocumentVersion::new(u64::from(n)).expect("document version");
-    command.request_nonce = RequestNonce::new([n; 16]);
+    command.document_version = DocumentVersion::new(n).expect("document version");
+    let mut nonce = [0_u8; 16];
+    nonce[8..].copy_from_slice(&n.to_be_bytes());
+    command.request_nonce = RequestNonce::new(nonce);
     command.idempotency_key =
         IdempotencyKey::new(format!("idem_sweep{n:011}")).expect("idempotency key");
     command
@@ -123,22 +125,19 @@ impl Drop for Server {
 }
 
 impl Server {
-    /// Starts the binary with only the harness's settings; `on_ready` runs at the first ready
-    /// answer.
-    async fn start(harness: &DemoHarness, on_ready: impl FnOnce()) -> Self {
-        let address = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
-            listener.local_addr().expect("free port address")
-        };
-        let child = Command::new(env!("CARGO_BIN_EXE_docchain-server"))
+    fn spawn(harness: &DemoHarness, address: SocketAddr, stderr: Stdio, stdout: Stdio) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_docchain-server"))
             .env_clear()
             .envs(harness.server_environment())
             .env("DOCCHAIN_HTTP__BIND", address.to_string())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stdout(stdout)
+            .stderr(stderr)
             .spawn()
-            .expect("server binary");
+            .expect("server binary")
+    }
+
+    async fn wait_until_ready(child: Child, address: SocketAddr, on_ready: impl FnOnce()) -> Self {
         let mut server = Self { child };
         let started = Instant::now();
         while ready(address).await != Some(204) {
@@ -155,23 +154,74 @@ impl Server {
         server
     }
 
+    /// Starts the binary with only the harness's settings; `on_ready` runs at the first ready
+    /// answer.
+    async fn start(harness: &DemoHarness, on_ready: impl FnOnce()) -> Self {
+        let address = free_address();
+        let child = Self::spawn(harness, address, Stdio::piped(), Stdio::null());
+        Self::wait_until_ready(child, address, on_ready).await
+    }
+
     /// Stops the process with SIGTERM and returns its standard error.
-    async fn stop(mut self) -> String {
+    async fn stop_with_status(mut self) -> (ExitStatus, String) {
         let status = Command::new("kill")
             .args(["-s", "TERM", &self.child.id().to_string()])
             .status()
             .expect("kill utility");
         assert!(status.success(), "kill -s TERM");
         let started = Instant::now();
-        while self.child.try_wait().expect("process status").is_none() {
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("process status") {
+                break status;
+            }
             assert!(started.elapsed() < Duration::from_secs(15), "no exit");
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        };
         let mut stderr = String::new();
         if let Some(mut pipe) = self.child.stderr.take() {
             pipe.read_to_string(&mut stderr).expect("stderr");
         }
+        (status, stderr)
+    }
+
+    /// Stops the process with SIGTERM, asserts a successful exit, and returns standard error.
+    async fn stop(self) -> String {
+        let (status, stderr) = self.stop_with_status().await;
+        assert!(status.success(), "server did not stop successfully");
         stderr
+    }
+}
+
+fn free_address() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+    listener.local_addr().expect("free port address")
+}
+
+fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        pipe.read_to_string(&mut text).expect("process stream");
+        text
+    })
+}
+
+async fn wait_for_exit_before_ready(child: &mut Child, address: SocketAddr) -> ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("process status") {
+            return status;
+        }
+        if ready(address).await == Some(204) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("server became ready");
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("server did not exit");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -234,6 +284,106 @@ async fn removes_unreferenced_object_before_readiness() {
         "report line missing"
     );
     assert_discloses_nothing(&harness, &stderr, &[&orphan]);
+}
+
+async fn refuses_row_security_on(table: &str) {
+    let mut harness = support::harness().await;
+    let sender = support::sender(&harness).await;
+    let delivery = harness
+        .send_copy(&sender, support::valid_request())
+        .await
+        .expect("delivery");
+    let referenced = harness.document_root().join(delivery.object_id.as_str());
+    let referenced_digest = digest(&referenced);
+    let orphan = plant_object(&harness.document_root());
+    let orphan_digest = digest(&orphan);
+    harness.release_service().await.expect("service released");
+    harness
+        .execute_unchecked(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
+        .await
+        .expect("row security enabled");
+
+    let address = free_address();
+    let mut child = Server::spawn(&harness, address, Stdio::piped(), Stdio::piped());
+    let stdout = drain(child.stdout.take().expect("standard output"));
+    let stderr = drain(child.stderr.take().expect("standard error"));
+    let status = wait_for_exit_before_ready(&mut child, address).await;
+    let stdout = stdout.join().expect("standard output");
+    let stderr = stderr.join().expect("standard error");
+
+    assert_eq!(status.code(), Some(1), "start did not fail closed");
+    assert_eq!(
+        stderr,
+        "docchain-server: service initialization failed: document store references\n"
+    );
+    assert_eq!(
+        stdout,
+        "{\"record\":\"startup-failed\",\"step\":\"document store references\"}\n"
+    );
+    assert_eq!(
+        digest(&referenced),
+        referenced_digest,
+        "stored bytes changed"
+    );
+    assert_eq!(digest(&orphan), orphan_digest, "planted bytes changed");
+    assert_discloses_nothing(
+        &harness,
+        &format!("{stdout}{stderr}"),
+        &[&referenced, &orphan],
+    );
+    assert!(
+        !stdout.contains(table) && !stderr.contains(table),
+        "failure named a reference table"
+    );
+
+    harness
+        .execute_unchecked(&format!("ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"))
+        .await
+        .expect("row security disabled");
+    let server = Server::start(&harness, || {}).await;
+    let stderr = server.stop().await;
+    assert_eq!(
+        digest(&referenced),
+        referenced_digest,
+        "stored bytes changed"
+    );
+    assert!(!orphan.exists(), "planted object remains");
+    assert!(
+        stderr.contains(
+            "docchain-server: document store sweep: removed 1 objects and 0 temporary files; \
+             kept 1 referenced objects; skipped 0 entries\n"
+        ),
+        "control report missing"
+    );
+}
+
+#[tokio::test]
+async fn refuses_sweep_when_row_security_is_enabled_on_exchanges() {
+    refuses_row_security_on("exchanges").await;
+}
+
+#[tokio::test]
+async fn refuses_sweep_when_row_security_is_enabled_on_audit_events() {
+    refuses_row_security_on("audit_events").await;
+}
+
+#[tokio::test]
+async fn serves_when_standard_error_is_closed() {
+    let mut harness = support::harness().await;
+    let orphan = plant_object(&harness.document_root());
+    harness.release_service().await.expect("service released");
+    let address = free_address();
+    let (reader, writer) = std::io::pipe().expect("standard error pipe");
+    drop(reader);
+    let child = Server::spawn(&harness, address, Stdio::from(writer), Stdio::null());
+
+    let server = Server::wait_until_ready(child, address, || {
+        assert!(!orphan.exists(), "the orphan outlived readiness");
+    })
+    .await;
+    let stderr = server.stop().await;
+
+    assert!(stderr.is_empty(), "closed standard error produced output");
 }
 
 #[tokio::test]
@@ -533,7 +683,7 @@ async fn skips_sweep_without_exclusivity() {
 
 #[tokio::test]
 async fn ignores_foreign_entries() {
-    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _, unix::fs::FileTypeExt as _};
 
     let mut harness = support::harness().await;
     let root = harness.document_root();
@@ -558,7 +708,17 @@ async fn ignores_foreign_entries() {
     // A special file with an object name. A socket stands in for a FIFO, which this
     // container's kernel policy refuses to create.
     let special = root.join(debris_id().as_str());
-    let _socket = std::os::unix::net::UnixListener::bind(&special).expect("socket file");
+    let root_handle = std::fs::File::open(&root).expect("store root handle");
+    let socket_name = special.file_name().expect("socket name").to_string_lossy();
+    let socket_at_handle = format!("/proc/self/fd/{}/{socket_name}", root_handle.as_raw_fd());
+    let _socket = std::os::unix::net::UnixListener::bind(socket_at_handle).expect("socket file");
+    assert!(
+        std::fs::symlink_metadata(&special)
+            .expect("socket metadata")
+            .file_type()
+            .is_socket(),
+        "special entry is not a socket"
+    );
     let orphan = plant_object(&root);
 
     let report = harness
@@ -571,6 +731,13 @@ async fn ignores_foreign_entries() {
     assert_eq!(
         std::fs::read(&outside).expect("outside file"),
         b"outside the store root"
+    );
+    assert!(
+        std::fs::symlink_metadata(&special)
+            .expect("socket metadata")
+            .file_type()
+            .is_socket(),
+        "special entry did not remain a socket"
     );
     for entry in [
         &foreign,
@@ -587,6 +754,112 @@ async fn ignores_foreign_entries() {
             "a foreign entry was removed"
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "synthetic whole-start measurement"]
+async fn measures_whole_start_over_ten_thousand_references() {
+    const REFERENCES: u64 = 10_000;
+    const DEBRIS: u64 = 100;
+
+    let mut harness = DemoHarness::new_with_limits(Limits {
+        pending_per_relationship: REFERENCES as u32,
+        ..Limits::default()
+    })
+    .await
+    .expect("harness");
+    let sender = support::sender(&harness).await;
+    let seeding_started = Instant::now();
+    for index in 1..=REFERENCES {
+        harness
+            .send_copy(&sender, request(index))
+            .await
+            .expect("synthetic send");
+    }
+    let seeding_elapsed = seeding_started.elapsed();
+
+    let exchange_references: i64 =
+        sqlx::query_scalar("SELECT COUNT(object_id) FROM exchanges WHERE object_id IS NOT NULL")
+            .fetch_one(harness.owner_pool())
+            .await
+            .expect("exchange reference count");
+    let event_references: i64 =
+        sqlx::query_scalar("SELECT COUNT(object_id) FROM audit_events WHERE object_id IS NOT NULL")
+            .fetch_one(harness.owner_pool())
+            .await
+            .expect("event reference count");
+    let stats = harness.stats().await.expect("state counts");
+    assert_eq!(exchange_references, REFERENCES as i64);
+    assert!(event_references >= REFERENCES as i64);
+    assert_eq!(stats.objects, REFERENCES as usize);
+
+    for _ in 0..DEBRIS {
+        let _ = plant_object(&harness.document_root());
+        let _ = plant_temporary(&harness.document_root());
+    }
+    let in_process_started = Instant::now();
+    let report = harness
+        .restart(StartOptions::default())
+        .await
+        .expect("in-process restart");
+    let in_process_elapsed = in_process_started.elapsed();
+    let sweep_elapsed = harness.service().sweep_elapsed();
+    assert_eq!(report, completed(DEBRIS, DEBRIS, REFERENCES, 0));
+
+    for _ in 0..DEBRIS {
+        let _ = plant_object(&harness.document_root());
+        let _ = plant_temporary(&harness.document_root());
+    }
+    harness.release_service().await.expect("service released");
+    let expected_report = format!(
+        "docchain-server: document store sweep: removed {DEBRIS} objects and {DEBRIS} \
+         temporary files; kept {REFERENCES} referenced objects; skipped 0 entries"
+    );
+    let address = free_address();
+    let launch_started = Instant::now();
+    let mut child = Server::spawn(&harness, address, Stdio::piped(), Stdio::null());
+    let stderr = child.stderr.take().expect("standard error");
+    let report_reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            if line.expect("report line") == expected_report {
+                return Some(launch_started.elapsed());
+            }
+        }
+        None
+    });
+    let ready_elapsed = loop {
+        if ready(address).await == Some(204) {
+            break launch_started.elapsed();
+        }
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "server exited before readiness"
+        );
+        assert!(
+            launch_started.elapsed() < Duration::from_secs(120),
+            "server did not become ready"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let (status, stderr) = Server { child }.stop_with_status().await;
+    assert!(status.success(), "server did not stop successfully");
+    assert!(stderr.is_empty(), "standard error was read twice");
+    let report_elapsed = report_reader
+        .join()
+        .expect("report reader")
+        .expect("sweep report");
+
+    println!(
+        "reference counts: exchanges={exchange_references}, audit_events={event_references}, \
+         objects={}",
+        stats.objects
+    );
+    println!("debris counts: objects={DEBRIS}, temporaries={DEBRIS}");
+    println!("seeding elapsed: {seeding_elapsed:?}");
+    println!("in-process start elapsed: {in_process_elapsed:?}");
+    println!("in-process sweep elapsed: {sweep_elapsed:?}");
+    println!("binary launch to report: {report_elapsed:?}");
+    println!("binary launch to ready: {ready_elapsed:?}");
 }
 
 #[tokio::test]

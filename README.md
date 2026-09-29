@@ -202,12 +202,14 @@ startup.
   or `docchain-server: document store sweep skipped: <reason>`, where the reason is
   `exclusivity not obtained` (another server holds the schema or root), `store root not bound`,
   `earlier transactions still open`, or `inventory over bound`. A skipped sweep removes nothing, and
-  the server still starts. No line names an object, a path, or a database identifier.
+  the server still starts. No line names an object, a path, or a database identifier. If the line
+  cannot be written, it is lost and the server still starts.
 - **Failures.** When the stored references cannot all be read, the server removes nothing and exits
   nonzero with `document store references`. The other startup failures of this step are
   `document store root`, `document store exclusivity` (the locks or the lease connection failed, or
   shared locks were not obtained within 10 seconds), `document store inventory`, and
-  `document store sweep`.
+  `document store sweep`. Row-level security enabled on `exchanges` or `audit_events` also fails at
+  `document store references`; the migration owner recovers by disabling row-level security.
 
 ### Database roles
 

@@ -257,6 +257,51 @@ mod database {
     }
 
     #[tokio::test]
+    async fn refuses_a_read_that_row_security_would_filter() {
+        let (_fixture, owner, store) = migrated().await;
+        let candidates: BTreeSet<ObjectId> = [object(ID)].into_iter().collect();
+        for table in ["exchanges", "audit_events"] {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"
+            )))
+            .execute(&owner)
+            .await
+            .unwrap();
+            assert_eq!(
+                store.referenced_among(&candidates).await,
+                Err(StoreError::Permanent)
+            );
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"
+            )))
+            .execute(&owner)
+            .await
+            .unwrap();
+            assert!(store.referenced_among(&candidates).await.is_ok());
+        }
+
+        sqlx::raw_sql(
+            "ALTER TABLE exchanges ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY sweep_visible ON exchanges USING (true)",
+        )
+        .execute(&owner)
+        .await
+        .unwrap();
+        assert_eq!(
+            store.referenced_among(&candidates).await,
+            Err(StoreError::Permanent)
+        );
+        sqlx::raw_sql(
+            "DROP POLICY sweep_visible ON exchanges; \
+             ALTER TABLE exchanges DISABLE ROW LEVEL SECURITY",
+        )
+        .execute(&owner)
+        .await
+        .unwrap();
+        assert!(store.referenced_among(&candidates).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn a_lock_taken_after_the_drain_hits_lock_timeout() {
         let (_fixture, owner, store) = migrated().await;
         let store = store.with_bounds(SweepBounds {

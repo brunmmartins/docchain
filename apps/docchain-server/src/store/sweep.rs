@@ -135,9 +135,8 @@ pub(crate) struct RootIdentity {
 }
 
 impl RootIdentity {
-    /// Reads the root's identity without following a symlink; the root must be a directory.
-    pub(crate) fn of(root: &Path) -> Result<Self, StoreError> {
-        let metadata = std::fs::symlink_metadata(root).map_err(map_io)?;
+    /// Builds an identity from one non-symlink directory metadata result.
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, StoreError> {
         if !metadata.file_type().is_dir() {
             return Err(StoreError::Permanent);
         }
@@ -145,6 +144,12 @@ impl RootIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
         })
+    }
+
+    /// Reads the root's identity without following a symlink; the root must be a directory.
+    pub(crate) fn of(root: &Path) -> Result<Self, StoreError> {
+        let metadata = std::fs::symlink_metadata(root).map_err(map_io)?;
+        Self::from_metadata(&metadata)
     }
 
     /// Fails unless `root` is still the directory that was opened.
@@ -355,7 +360,8 @@ impl PgExchangeStore {
             .await
             .map_err(map_sql)?;
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "SET LOCAL statement_timeout = '{}ms'; SET LOCAL lock_timeout = '{}ms'",
+            "SET LOCAL statement_timeout = '{}ms'; SET LOCAL lock_timeout = '{}ms'; \
+             SET LOCAL row_security = off",
             self.bounds.scan_statement.as_millis(),
             self.bounds.scan_lock.as_millis()
         )))

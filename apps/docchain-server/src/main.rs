@@ -1,4 +1,4 @@
-use std::{process::ExitCode, sync::Arc};
+use std::{io::Write as _, process::ExitCode, sync::Arc};
 
 use docchain_server::{
     DocchainService, HttpConfig, ServiceError,
@@ -54,13 +54,18 @@ async fn main() -> ExitCode {
             if let Some(failure) = error.failure() {
                 diagnostics.startup_failed(failure);
             }
-            eprintln!("docchain-server: {error}");
+            write_stderr(&error);
             ExitCode::FAILURE
         }
     };
     // Bounded: records still queued after the limit are lost.
     diagnostics.flush(EXIT_FLUSH_LIMIT);
     code
+}
+
+fn write_stderr(text: &impl std::fmt::Display) {
+    let line = format!("docchain-server: {text}\n");
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
 /// Diagnostics (already started), settings, database checks, adapters, the document-store lease
@@ -70,7 +75,7 @@ async fn run(diagnostics: &Diagnostics) -> Result<(), StartupError> {
     let diagnostics = diagnostics.clone().with_spans(settings.diagnostics.spans);
     let service = Arc::new(DocchainService::compose(&settings).await?);
     // One line with counts or a skip reason only.
-    eprintln!("docchain-server: {}", service.sweep_report());
+    write_stderr(&service.sweep_report());
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| StartupError::Signal)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(|_| StartupError::Signal)?;
     let listener = tokio::net::TcpListener::bind(settings.http.bind)
