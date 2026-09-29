@@ -66,6 +66,7 @@ values are supplied as mounted files. The settings are:
 | `DOCCHAIN_KEYS__AUDIT_PUBLIC_KEY_FINGERPRINT` | Required canonical base64url SHA-256 fingerprint, provisioned separately |
 | `DOCCHAIN_AUDIT__MAX_EXPORT_EVENTS` | `100000` (accepted range 1 to 100000) |
 | `DOCCHAIN_AUDIT__DEFAULT_PAGE_SIZE` | `100` (accepted range 1 to 500) |
+| `DOCCHAIN_DIAGNOSTICS__SPANS` | `on`; `off` stops the request and use-case records only. Any other value stops startup |
 
 A missing or malformed setting stops startup with a message that names the variable but never its
 value. `PGOPTIONS` is refused so it cannot override the configured schema. PostgreSQL TLS variables
@@ -97,6 +98,45 @@ time is refused by the migration, because no true value exists for them.
 PostgreSQL responds and the document-store root was proven writable within the last second, and
 `503` with an empty body otherwise. At most one writability probe runs at a time, and its result
 answers every readiness check for one second.
+
+### Diagnostics
+
+The server writes diagnostic records to standard output, one JSON object per line, and nothing else
+there. Standard error keeps only its human-readable lines. Every record field is a fixed word or an
+integer; no record holds a path, query, header, body, identifier, key, secret, or free text, and the
+server installs no logger, so dependency messages such as SQL text are never printed. Records carry no
+timestamp: the collector that reads standard output stamps each line.
+
+- `{"record":"request","request_id":1,"operation":"send-copy","outcome":"ok","duration_us":1234}`,
+  one per HTTP request, and `{"record":"use-case",...}` with the same fields, one per application call
+  that request makes. `request_id` is a sequence number that restarts at 1 with each process; it never
+  comes from the request, is never returned to the client, and `X-Request-Id` or `traceparent` is
+  ignored. `operation` is `send-copy`, `accept`, `read-document`, `list-inbox`, `verify-audit`,
+  `audit-key`, `export-audit-events`, `live`, `ready`, `read-counters`, or `unmatched`. `outcome` is
+  `ok`, `cancelled`, the response's error category (for example `forbidden` or `replay`), `not-ready`,
+  or, when a response has no category, `not-found`, `method-not-allowed`, `payload-too-large`,
+  `rejected`, or `server-error`.
+- `{"record":"startup-failed","step":"audit key file"}`, once, when startup fails before the listener
+  binds, next to the unchanged standard-error line. A configuration failure adds `setting` and
+  `reason`, for example `"setting":"DOCCHAIN_DATABASE__PORT","reason":"has an invalid value"`; a
+  setting or reason outside the fixed list is reported as `DOCCHAIN_*` and `is invalid`.
+
+Records are best-effort and are not an audit trail. They pass through a queue of 4,096 records to one
+writer thread, a full queue drops a record instead of delaying a request, and the process waits at
+most one second at exit for queued records. Records hold no identifier, but a reader who also holds
+the event chain can link them to activity by the collector's timestamps, so treat standard output as
+pseudonymous activity metadata.
+
+`GET /operations/counters` returns exact per-process counts for the operator credential only, behind
+the same admission limit and deadline as the API, with `Cache-Control: no-store`:
+
+```json
+{"version":1,"counters":[{"operation":"send-copy","outcome":"ok","count":2}],"dropped_records":0}
+```
+
+`counters` lists only nonzero operation and outcome pairs; `dropped_records` counts records lost from
+the queue. Counts restart at zero with the process, and a read does not count itself. A missing or
+unknown credential gets `401`, any other role `403`, and a query or a body `422`.
 
 Every API request carries `Authorization: Bearer <credential>`, verified against the configured
 credential file; no other header selects a wallet or role.

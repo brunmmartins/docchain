@@ -1612,6 +1612,22 @@ fn publishes_only_the_pinned_audit_public_key_to_auditors() {
     assert!(AuditPublicKey::new([42; 32], AuditKeyPin::new([0; 32])).is_err());
 }
 
+#[test]
+fn only_the_operator_is_granted_an_operational_read() {
+    let application = application();
+    for caller in [actor(SENDER), actor(RECIPIENT), Actor::Auditor] {
+        assert!(matches!(
+            application.authorize_operational_read(&caller),
+            Err(ApplicationError::Forbidden)
+        ));
+    }
+    assert!(
+        application
+            .authorize_operational_read(&Actor::Operator)
+            .is_ok()
+    );
+}
+
 /// Delivers and accepts one copy, leaving two events.
 fn two_events(application: &Application<Fakes>) {
     let delivered = block_on(application.send_copy(&actor(SENDER), command())).expect("delivery");

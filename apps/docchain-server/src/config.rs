@@ -44,6 +44,16 @@ pub struct Settings {
     pub audit: AuditSettings,
     /// Mock identity credential file.
     pub identity_credentials_file: PathBuf,
+    /// Diagnostic record switches.
+    pub diagnostics: DiagnosticsSettings,
+}
+
+/// Which diagnostic records the server writes. Counters and startup-failure records are always on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiagnosticsSettings {
+    /// Whether request and use-case span records are written, from
+    /// `DOCCHAIN_DIAGNOSTICS__SPANS` (`on`, the default, or `off`).
+    pub spans: bool,
 }
 
 /// Validated PostgreSQL coordinates.
@@ -219,6 +229,7 @@ impl fmt::Debug for Settings {
             .field("keys", &self.keys)
             .field("audit", &self.audit)
             .field("identity_credentials_file", &"redacted")
+            .field("diagnostics", &self.diagnostics)
             .finish()
     }
 }
@@ -243,6 +254,18 @@ impl SettingsError {
             key: key.into(),
             reason,
         }
+    }
+
+    /// The key that failed, as the human-readable message names it.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Why the key failed: a fixed text that never includes the value.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        self.reason
     }
 }
 
@@ -370,6 +393,16 @@ impl Settings {
                 "must be from 1 through 500",
             ));
         }
+        let spans = match get("DOCCHAIN_DIAGNOSTICS__SPANS") {
+            None | Some("on") => true,
+            Some("off") => false,
+            Some(_) => {
+                return Err(SettingsError::new(
+                    "DOCCHAIN_DIAGNOSTICS__SPANS",
+                    "must be on or off",
+                ));
+            }
+        };
 
         Ok(Self {
             database: DatabaseSettings {
@@ -419,6 +452,7 @@ impl Settings {
                 get("DOCCHAIN_IDENTITY__CREDENTIALS_FILE"),
                 "DOCCHAIN_IDENTITY__CREDENTIALS_FILE",
             )?,
+            diagnostics: DiagnosticsSettings { spans },
         })
     }
 }
@@ -593,6 +627,42 @@ mod tests {
         assert_eq!(settings.keys.wallet_encryption_private.len(), 1);
         assert_eq!(settings.audit.max_export_events, 100_000);
         assert_eq!(settings.audit.default_page_size, 100);
+        assert!(settings.diagnostics.spans);
+    }
+
+    #[test]
+    fn spans_switch_is_on_or_off_and_nothing_else() {
+        for (value, spans) in [("on", true), ("off", false)] {
+            let mut values = complete_values();
+            values.insert("DOCCHAIN_DIAGNOSTICS__SPANS".to_owned(), value.to_owned());
+            assert_eq!(
+                Settings::from_map(values).expect(value).diagnostics.spans,
+                spans
+            );
+        }
+        for value in ["", "ON", "true", "1", "invented-spans-value"] {
+            let mut values = complete_values();
+            values.insert("DOCCHAIN_DIAGNOSTICS__SPANS".to_owned(), value.to_owned());
+            let error = Settings::from_map(values).expect_err(value);
+            assert_eq!(
+                (error.key(), error.reason()),
+                ("DOCCHAIN_DIAGNOSTICS__SPANS", "must be on or off")
+            );
+            assert!(!error.to_string().contains("invented-spans-value"));
+        }
+    }
+
+    #[test]
+    fn accessors_return_the_stored_key_and_reason() {
+        let mut values = complete_values();
+        values.insert("DOCCHAIN_HTTP__MAX_IN_FLIGHT".to_owned(), "0".to_owned());
+        let error = Settings::from_map(values).expect_err("bad limit");
+        assert_eq!(error.key(), "DOCCHAIN_HTTP__MAX_IN_FLIGHT");
+        assert_eq!(error.reason(), "must be from 1 through 1024");
+        assert_eq!(
+            error.to_string(),
+            "invalid configuration key DOCCHAIN_HTTP__MAX_IN_FLIGHT: must be from 1 through 1024"
+        );
     }
 
     #[test]

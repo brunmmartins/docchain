@@ -82,3 +82,8 @@ required-features = ["test-support"]
 name = "orphan_sweep"
 path = "../../tests/system/orphan_sweep.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "diagnostics"
+path = "../../tests/system/diagnostics.rs"
+required-features = ["test-support"]

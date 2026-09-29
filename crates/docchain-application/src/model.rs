@@ -18,6 +18,24 @@ pub enum Actor {
     Operator,
 }
 
+/// Proof that [`Application::authorize_operational_read`](crate::Application::authorize_operational_read)
+/// allowed the operator to read operational counters.
+///
+/// Only that use case issues one. It cannot be built, cloned, copied, or defaulted anywhere else, so
+/// a reader that requires it cannot run without the authorization decision:
+///
+/// ```compile_fail
+/// let grant = docchain_application::OperationalReadGrant(());
+/// ```
+#[derive(Debug)]
+pub struct OperationalReadGrant(());
+
+impl OperationalReadGrant {
+    pub(crate) const fn issue() -> Self {
+        Self(())
+    }
+}
+
 /// A credential presented by a client. `Debug` is redacted.
 #[derive(Clone)]
 pub struct Credential(String);

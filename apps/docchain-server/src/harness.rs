@@ -6,7 +6,8 @@ use std::sync::Arc;
 use docchain_application::{
     AcceptanceResult, Actor, Adapters, Application, ApplicationError, AuditExportPage,
     AuditExportRequest, AuditKeyPin, AuditPublicKey, AuditReport, AuditSettings, Credential,
-    Delivery, EventIntegrity as _, Limits, SendCopyCommand, StoreSweep, SweepError, sweep_debris,
+    Delivery, EventIntegrity as _, Limits, OperationalReadGrant, SendCopyCommand, StoreSweep,
+    SweepError, sweep_debris,
 };
 #[cfg(feature = "test-support")]
 use docchain_application::{AuditEventStore as _, AuditReadRequest};
@@ -334,6 +335,20 @@ impl DocchainService {
         self.application
             .authenticate(&credential)
             .await
+            .map_err(Into::into)
+    }
+
+    /// Authorizes reading the operational counters: the operator only.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Application`] with `Forbidden` for any other actor.
+    pub fn authorize_operational_read(
+        &self,
+        actor: &Actor,
+    ) -> Result<OperationalReadGrant, ServiceError> {
+        self.application
+            .authorize_operational_read(actor)
             .map_err(Into::into)
     }
 

@@ -8,7 +8,7 @@ mod sweep;
 pub use model::{
     AcceptanceResult, Actor, ApplicationError, AuditExportEvent, AuditExportPage,
     AuditExportRequest, AuditKeyPin, AuditMismatch, AuditPublicKey, AuditReport, AuditSettings,
-    Coverage, Credential, Delivery, Limits, Plaintext, SendCopyCommand,
+    Coverage, Credential, Delivery, Limits, OperationalReadGrant, Plaintext, SendCopyCommand,
 };
 pub use ports::{
     AcceptanceOutcome, Adapters, AuditCreditSnapshot, AuditEventStore, AuditReadError,

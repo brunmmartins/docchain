@@ -29,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{sync::Semaphore, time};
 
-use crate::{DocchainService, ServiceError};
+use crate::{
+    DocchainService, ServiceError,
+    diagnostics::{self, CountersSnapshot, Diagnostics, Outcome, UseCaseScope},
+};
 
 /// Limits applied at the untrusted HTTP boundary.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +55,7 @@ impl Default for HttpConfig {
 #[derive(Clone)]
 struct HttpState {
     service: Arc<DocchainService>,
+    diagnostics: Diagnostics,
 }
 
 #[derive(Clone)]
@@ -60,22 +64,40 @@ struct Gate {
     permits: Arc<Semaphore>,
 }
 
-/// Builds the version 1 API around the fully composed service.
+/// Builds the version 1 API around the fully composed service, with diagnostics that write no
+/// record. Counters still count.
 ///
 /// Admission and the end-to-end deadline run before body extraction. Every business handler
 /// authenticates a credential through the identity port before invoking a use case.
 pub fn router(service: Arc<DocchainService>, config: HttpConfig) -> Router {
-    let state = HttpState { service };
+    router_with_diagnostics(service, config, Diagnostics::discarding())
+}
+
+/// Builds the version 1 API and the operational routes around the fully composed service, with
+/// `diagnostics` recording one request span per request and one use-case span per application
+/// call, and serving its counters to the operator.
+///
+/// Admission and the end-to-end deadline run before body extraction. Every business handler
+/// authenticates a credential through the identity port before invoking a use case.
+pub fn router_with_diagnostics(
+    service: Arc<DocchainService>,
+    config: HttpConfig,
+    diagnostics: Diagnostics,
+) -> Router {
+    let state = HttpState {
+        service,
+        diagnostics: diagnostics.clone(),
+    };
     let gate = Gate {
         deadline: config.request_timeout,
         permits: Arc::new(Semaphore::new(config.max_in_flight)),
     };
     let business = Router::new()
-        .route("/v1/send-copies", post(send_copy))
-        .route("/v1/exchanges/{exchange_id}/acceptances", post(accept))
-        .route("/v1/exchanges/{exchange_id}/document", get(read_document))
-        .route("/v1/inboxes/{wallet_id}", get(list_inbox))
-        .route("/v1/audit/verify", get(verify_audit))
+        .route(SEND_COPIES_ROUTE, post(send_copy))
+        .route(ACCEPT_ROUTE, post(accept))
+        .route(READ_DOCUMENT_ROUTE, get(read_document))
+        .route(INBOX_ROUTE, get(list_inbox))
+        .route(AUDIT_VERIFY_ROUTE, get(verify_audit))
         .route(
             AUDIT_KEY_ROUTE,
             get(audit_key).layer(DefaultBodyLimit::max(0)),
@@ -84,29 +106,51 @@ pub fn router(service: Arc<DocchainService>, config: HttpConfig) -> Router {
             AUDIT_EXPORT_ROUTE,
             post(export_audit_events).layer(DefaultBodyLimit::max(MAX_AUDIT_EXPORT_BODY)),
         )
+        .route(
+            COUNTERS_ROUTE,
+            get(read_counters).layer(DefaultBodyLimit::max(0)),
+        )
         .layer(DefaultBodyLimit::max(MAX_DOCUMENT_BYTES))
         .layer(middleware::from_fn_with_state(gate, admission));
     Router::new()
-        .route("/health/live", get(live))
-        .route("/health/ready", get(ready))
+        .route(LIVE_ROUTE, get(live))
+        .route(READY_ROUTE, get(ready))
         .merge(business)
+        // The same empty 404 as the default, made explicit so the request span also wraps it.
+        .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(middleware::from_fn(no_store))
+        .layer(middleware::from_fn_with_state(
+            diagnostics,
+            diagnostics::request_span,
+        ))
         .with_state(state)
 }
 
-const AUDIT_KEY_ROUTE: &str = "/v1/audit/key";
+pub(crate) const SEND_COPIES_ROUTE: &str = "/v1/send-copies";
+pub(crate) const ACCEPT_ROUTE: &str = "/v1/exchanges/{exchange_id}/acceptances";
+pub(crate) const READ_DOCUMENT_ROUTE: &str = "/v1/exchanges/{exchange_id}/document";
+pub(crate) const INBOX_ROUTE: &str = "/v1/inboxes/{wallet_id}";
+pub(crate) const AUDIT_VERIFY_ROUTE: &str = "/v1/audit/verify";
+pub(crate) const AUDIT_KEY_ROUTE: &str = "/v1/audit/key";
 pub(crate) const AUDIT_EXPORT_ROUTE: &str = "/v1/audit/events/export";
+pub(crate) const LIVE_ROUTE: &str = "/health/live";
+pub(crate) const READY_ROUTE: &str = "/health/ready";
+/// Operational, outside `/v1`: the operator's view of the outcome counters.
+pub(crate) const COUNTERS_ROUTE: &str = "/operations/counters";
 /// Largest accepted export request body, in bytes.
 const MAX_AUDIT_EXPORT_BODY: usize = 4 * 1024;
 /// Deepest accepted export request nesting.
 const MAX_AUDIT_EXPORT_DEPTH: usize = 4;
 
-/// Marks every response on the audit proof routes, including overload, timeout, and method
-/// errors produced outside their handlers, as uncacheable. The routes have no path parameters,
-/// so the path equals the route template. Serving applies it again outside its shutdown
-/// cancellation, so a proof request cancelled at the drain deadline is marked too.
+/// Marks every response on the audit proof routes and the counters route, including overload,
+/// timeout, and method errors produced outside their handlers, as uncacheable. The routes have no
+/// path parameters, so the path equals the route template. Serving applies it again outside its
+/// shutdown cancellation, so a proof request cancelled at the drain deadline is marked too.
 pub(crate) async fn no_store(request: Request, next: Next) -> Response {
-    let proof_route = matches!(request.uri().path(), AUDIT_KEY_ROUTE | AUDIT_EXPORT_ROUTE);
+    let proof_route = matches!(
+        request.uri().path(),
+        AUDIT_KEY_ROUTE | AUDIT_EXPORT_ROUTE | COUNTERS_ROUTE
+    );
     let mut response = next.run(request).await;
     if proof_route {
         response
@@ -136,11 +180,34 @@ async fn live() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn ready(State(state): State<HttpState>) -> StatusCode {
-    match state.service.ready().await {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+async fn ready(State(state): State<HttpState>, scope: UseCaseScope) -> Response {
+    match scope.run(state.service.ready()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => {
+            let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+            response.extensions_mut().insert(Outcome::NotReady);
+            response
+        }
     }
+}
+
+/// `GET /operations/counters`: the operation × outcome counters, for the operator only.
+///
+/// It works in the audit key handler's order: authenticate, then refuse a query or a body, then
+/// authorize through the application, whose grant is the only way to read the counters.
+async fn read_counters(
+    State(state): State<HttpState>,
+    scope: UseCaseScope,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<CountersSnapshot>, ApiError> {
+    let actor = authenticate(&state, &headers).await?;
+    if uri.query().is_some() || !body.is_ok_and(|body| body.is_empty()) {
+        return Err(ApiError::InvalidRequest);
+    }
+    let grant = scope.run_sync(|| state.service.authorize_operational_read(&actor))?;
+    Ok(Json(state.diagnostics.counters().snapshot(&grant)))
 }
 
 #[derive(Deserialize)]
@@ -166,6 +233,7 @@ struct DeliveryDto {
 
 async fn send_copy(
     State(state): State<HttpState>,
+    scope: UseCaseScope,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<DeliveryDto>), ApiError> {
@@ -189,7 +257,7 @@ async fn send_copy(
         schema_version: dto.schema_version,
         document: canonicalize(&dto.document).map_err(|_| ApiError::InvalidRequest)?,
     };
-    let delivered = state.service.send_copy(&actor, command).await?;
+    let delivered = scope.run(state.service.send_copy(&actor, command)).await?;
     Ok((
         StatusCode::CREATED,
         Json(DeliveryDto {
@@ -214,6 +282,7 @@ struct AcceptanceDtoOut {
 
 async fn accept(
     State(state): State<HttpState>,
+    scope: UseCaseScope,
     Path(exchange_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -224,7 +293,9 @@ async fn accept(
     let dto: AcceptanceDto =
         serde_json::from_value(strict.value().clone()).map_err(|_| ApiError::InvalidRequest)?;
     let key = IdempotencyKey::new(dto.idempotency_key).map_err(|_| ApiError::InvalidRequest)?;
-    let accepted = state.service.accept(&actor, &exchange_id, &key).await?;
+    let accepted = scope
+        .run(state.service.accept(&actor, &exchange_id, &key))
+        .await?;
     Ok(Json(AcceptanceDtoOut {
         exchange_id: accepted.exchange_id.to_string(),
         credit_awarded: accepted.credit_awarded,
@@ -233,12 +304,15 @@ async fn accept(
 
 async fn read_document(
     State(state): State<HttpState>,
+    scope: UseCaseScope,
     Path(exchange_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let actor = authenticate(&state, &headers).await?;
     let exchange_id = ExchangeId::new(exchange_id).map_err(|_| ApiError::InvalidRequest)?;
-    let document = state.service.read_document(&actor, &exchange_id).await?;
+    let document = scope
+        .run(state.service.read_document(&actor, &exchange_id))
+        .await?;
     Ok((
         StatusCode::OK,
         [(CONTENT_TYPE, "application/json")],
@@ -254,14 +328,14 @@ struct InboxDto {
 
 async fn list_inbox(
     State(state): State<HttpState>,
+    scope: UseCaseScope,
     Path(wallet_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<InboxDto>, ApiError> {
     let actor = authenticate(&state, &headers).await?;
     let wallet = WalletId::new(wallet_id).map_err(|_| ApiError::InvalidRequest)?;
-    let exchange_ids = state
-        .service
-        .list_inbox(&actor, &wallet)
+    let exchange_ids = scope
+        .run(state.service.list_inbox(&actor, &wallet))
         .await?
         .into_iter()
         .map(|id| id.to_string())
@@ -308,6 +382,7 @@ struct AuditKeyDto {
 /// anchor: a verifier compares it with the value provisioned to it separately.
 async fn audit_key(
     State(state): State<HttpState>,
+    scope: UseCaseScope,
     headers: HeaderMap,
     uri: Uri,
     body: Result<Bytes, BytesRejection>,
@@ -316,7 +391,7 @@ async fn audit_key(
     if uri.query().is_some() || !body.is_ok_and(|body| body.is_empty()) {
         return Err(ApiError::InvalidRequest);
     }
-    let proof = state.service.audit_public_key(&actor)?;
+    let proof = scope.run_sync(|| state.service.audit_public_key(&actor))?;
     Ok(Json(AuditKeyDto {
         public_key: URL_SAFE_NO_PAD.encode(proof.public_key()),
         fingerprint: URL_SAFE_NO_PAD.encode(proof.fingerprint().as_bytes()),
@@ -385,6 +460,7 @@ struct ExportPageDto {
 /// neither proves absolute freshness.
 async fn export_audit_events(
     State(state): State<HttpState>,
+    scope: UseCaseScope,
     headers: HeaderMap,
     uri: Uri,
     body: Result<Bytes, BytesRejection>,
@@ -415,9 +491,8 @@ async fn export_audit_events(
         ),
     }
     .map_err(|_| ApiError::InvalidRequest)?;
-    state
-        .service
-        .export_audit_events(&actor, request)
+    scope
+        .run(state.service.export_audit_events(&actor, request))
         .await
         .map(export_page_dto)
         .map(Json)
@@ -487,12 +562,15 @@ fn export_page_dto(page: AuditExportPage) -> ExportPageDto {
 
 async fn verify_audit(
     State(state): State<HttpState>,
+    scope: UseCaseScope,
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<Json<AuditDto>, ApiError> {
     let actor = authenticate(&state, &headers).await?;
     let expected = expected_head(uri.query())?;
-    let report = state.service.verify_audit(&actor, expected).await?;
+    let report = scope
+        .run(state.service.verify_audit(&actor, expected))
+        .await?;
     Ok(Json(AuditDto {
         valid: true,
         event_count: report.event_count,
@@ -599,8 +677,22 @@ struct Problem {
     reason: Option<&'static str>,
 }
 
+impl ApiError {
+    /// The diagnostic outcome, which matches the Problem category.
+    const fn outcome(&self) -> Outcome {
+        match self {
+            Self::Unauthenticated => Outcome::Unauthenticated,
+            Self::InvalidRequest => Outcome::InvalidRequest,
+            Self::Overloaded => Outcome::Overloaded,
+            Self::Timeout => Outcome::Timeout,
+            Self::Service(error) => Outcome::from_service_error(error),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let outcome = self.outcome();
         let (status, category) = match &self {
             Self::Unauthenticated => (StatusCode::UNAUTHORIZED, "unauthenticated"),
             Self::InvalidRequest => (StatusCode::UNPROCESSABLE_ENTITY, "invalid-request"),
@@ -614,7 +706,9 @@ impl IntoResponse for ApiError {
             }
             _ => None,
         };
-        (status, Json(Problem { category, reason })).into_response()
+        let mut response = (status, Json(Problem { category, reason })).into_response();
+        response.extensions_mut().insert(outcome);
+        response
     }
 }
 
@@ -650,6 +744,64 @@ fn service_problem(error: &ServiceError) -> (StatusCode, &'static str) {
         ServiceError::Inspection => StatusCode::SERVICE_UNAVAILABLE,
     };
     (status, error.category())
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use docchain_application::AuditMismatch;
+
+    use super::*;
+
+    #[test]
+    fn every_api_error_carries_the_outcome_named_by_its_category() {
+        let mut errors = vec![
+            ApiError::Unauthenticated,
+            ApiError::InvalidRequest,
+            ApiError::Overloaded,
+            ApiError::Timeout,
+            ApiError::Service(ServiceError::Initialization("database connection")),
+        ];
+        errors.extend(
+            [
+                ApplicationError::Unauthenticated,
+                ApplicationError::Forbidden,
+                ApplicationError::InvalidRequest,
+                ApplicationError::InvalidDocument,
+                ApplicationError::UnsupportedSchema,
+                ApplicationError::KeyBinding,
+                ApplicationError::Replay,
+                ApplicationError::PendingLimit,
+                ApplicationError::InvalidEnvelope,
+                ApplicationError::IntegrityFailure,
+                ApplicationError::AuditMismatch(AuditMismatch::EventChain),
+                ApplicationError::AuditIncomplete,
+                ApplicationError::Unavailable,
+                ApplicationError::Invariant,
+            ]
+            .map(|error| ApiError::Service(ServiceError::Application(error))),
+        );
+        for error in errors {
+            let expected = error.outcome();
+            let response = error.into_response();
+            assert_eq!(response.extensions().get::<Outcome>(), Some(&expected));
+            assert_eq!(problem_body(response)["category"], expected.as_str());
+        }
+        // The shutdown cancellation is a dependency failure too.
+        assert_eq!(
+            cancelled_at_shutdown().extensions().get::<Outcome>(),
+            Some(&Outcome::DependencyFailure)
+        );
+    }
+
+    /// The Problem body of a response built in memory.
+    fn problem_body(response: Response) -> Value {
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(axum::body::to_bytes(response.into_body(), 1_024))
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("Problem JSON")
+    }
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -1415,6 +1567,23 @@ mod tests {
                 serde_json::json!({"exchange_id": exchange, "credit_awarded": 1})
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unmatched_paths_keep_the_empty_404_and_counters_are_no_store() {
+        let harness = DemoHarness::new().await.expect("harness");
+        let app = || router(harness.service(), HttpConfig::default());
+        let missing = send(app(), &get("/v1/unknown", "")).await;
+        assert_eq!(missing.status, 404);
+        assert!(missing.body.is_empty());
+        assert!(!missing.no_store());
+        for credential in ["", &bearer(&harness.operator_credential)] {
+            let reply = send(app(), &get(COUNTERS_ROUTE, credential)).await;
+            assert!(reply.no_store(), "{}", reply.status);
+        }
+        let wrong_method = send(app(), &post(COUNTERS_ROUTE, "", "")).await;
+        assert_eq!(wrong_method.status, 405);
+        assert!(wrong_method.no_store());
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use docchain_domain::{
 use crate::{
     AcceptanceResult, Actor, ApplicationError, AuditExportEvent, AuditExportPage,
     AuditExportRequest, AuditMismatch, AuditPublicKey, AuditReport, AuditSettings, Coverage,
-    Credential, Delivery, Limits, Plaintext, SendCopyCommand,
+    Credential, Delivery, Limits, OperationalReadGrant, Plaintext, SendCopyCommand,
     model::AuditExportKind,
     ports::{
         AcceptanceOutcome, Adapters, AuditEventStore as _, AuditReadError, AuditReadRequest,
@@ -506,6 +506,24 @@ impl<A: Adapters> Application<A> {
             return Err(ApplicationError::Forbidden);
         }
         Ok(self.audit.public_key())
+    }
+
+    /// Authorizes reading the operational counters, which only the platform operator may do.
+    ///
+    /// The returned grant is the only way to read the counters, so no reader can skip this
+    /// decision.
+    ///
+    /// # Errors
+    ///
+    /// [`ApplicationError::Forbidden`] unless the actor is the operator.
+    pub fn authorize_operational_read(
+        &self,
+        actor: &Actor,
+    ) -> Result<OperationalReadGrant, ApplicationError> {
+        if *actor != Actor::Operator {
+            return Err(ApplicationError::Forbidden);
+        }
+        Ok(OperationalReadGrant::issue())
     }
 
     /// Selects or continues one bounded challenge-bound snapshot export.
