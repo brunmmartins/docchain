@@ -471,14 +471,17 @@ impl DocchainService {
 }
 
 /// The read-only startup checks on one pooled connection, in order, each failing with its own
-/// step name.
+/// step name when it observes a state that breaks it. A failed query observes nothing, so it
+/// reports `database connection` at any check.
 async fn check_database(pool: &sqlx::PgPool, schema: &str) -> Result<(), ServiceError> {
     let mut conn = pool
         .acquire()
         .await
         .map_err(|_| ServiceError::Initialization("database connection"))?;
-    if !matches!(schema_exists(&mut conn, schema).await, Ok(true)) {
-        return Err(ServiceError::Initialization("database schema"));
+    match schema_exists(&mut conn, schema).await {
+        Ok(true) => {}
+        Ok(false) => return Err(ServiceError::Initialization("database schema")),
+        Err(_) => return Err(ServiceError::Initialization("database connection")),
     }
     match migration_state(&mut conn, schema).await {
         Ok(MigrationState::Current) => {}
@@ -495,20 +498,22 @@ async fn check_database(pool: &sqlx::PgPool, schema: &str) -> Result<(), Service
     let current_schema: Option<String> = sqlx::query_scalar("SELECT current_schema()::text")
         .fetch_one(&mut *conn)
         .await
-        .map_err(|_| ServiceError::Initialization("database schema"))?;
+        .map_err(|_| ServiceError::Initialization("database connection"))?;
     if current_schema.as_deref() != Some(schema) {
         return Err(ServiceError::Initialization("database schema"));
     }
     let role_privileges = ServiceError::Initialization("database role privileges");
     let (session, current) = session_roles(&mut conn)
         .await
-        .map_err(|_| ServiceError::Initialization("database role privileges"))?;
+        .map_err(|_| ServiceError::Initialization("database connection"))?;
     if session != current {
         return Err(role_privileges);
     }
+    // A failed read means only that the rule could not be evaluated; it still refuses.
     match runtime_privilege_violations(&mut conn, &current).await {
         Ok(violations) if violations.is_empty() => Ok(()),
-        _ => Err(role_privileges),
+        Ok(_nonempty) => Err(role_privileges),
+        Err(_) => Err(ServiceError::Initialization("database connection")),
     }
 }
 
@@ -562,6 +567,30 @@ pub(crate) struct FixtureFiles {
     /// The `DOCCHAIN_` variables `docchain-migrate` reads; no runtime password.
     migration_environment: Vec<(String, String)>,
     credentials: [String; 6],
+}
+
+/// A fixture root being written. Dropping it while armed removes the root, so a fixture that
+/// fails, or unwinds, after creating its root leaves nothing behind.
+#[cfg(feature = "test-support")]
+struct NewFixtureRoot(Option<std::path::PathBuf>);
+
+#[cfg(feature = "test-support")]
+impl NewFixtureRoot {
+    /// Takes the root out, so that dropping the guard leaves it in place.
+    fn disarm(mut self) -> std::path::PathBuf {
+        self.0
+            .take()
+            .expect("the guard is armed until this call consumes it")
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for NewFixtureRoot {
+    fn drop(&mut self) {
+        if let Some(root) = self.0.take() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 }
 
 /// The process environment, keeping only Unicode variables.
@@ -631,6 +660,8 @@ impl FixtureFiles {
         let schema = format!("docchain_test_{}_{}", std::process::id(), suffix);
         let root = parent.join(&schema);
         std::fs::create_dir_all(&root).map_err(|_| ServiceError::Initialization("test fixture"))?;
+        // From here every early return, and any unwind, removes the new root.
+        let guard = NewFixtureRoot(Some(root.clone()));
         let fixture: Value =
             serde_json::from_str(include_str!("../../../tests/vectors/envelope-v1.json"))
                 .map_err(|_| ServiceError::Initialization("test fixture"))?;
@@ -818,9 +849,10 @@ impl FixtureFiles {
         let settings = Settings::from_map(values)
             .map_err(|_| ServiceError::Initialization("test fixture runtime settings"))?;
 
+        // Nothing fallible remains: the complete fixture's own `Drop` removes the root.
         Ok(Self {
             schema,
-            root,
+            root: guard.disarm(),
             object_root,
             settings,
             owner,
@@ -1717,7 +1749,16 @@ fn write(path: &std::path::Path, value: &str) -> Result<(), ServiceError> {
 mod tests {
     use std::{
         collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
     };
 
     use super::*;
@@ -1832,6 +1873,31 @@ mod tests {
             assert_eq!(entries(), 0, "{key} left files behind");
         }
 
+        // With every credential key present, settings refused after the root exists still
+        // leave nothing behind.
+        for (key, value, refusal) in [
+            (
+                "DOCCHAIN_MIGRATION__USER",
+                "docchain_runtime",
+                "test fixture migration owner settings",
+            ),
+            (
+                "DOCCHAIN_DATABASE__MAX_CONNECTIONS",
+                "1",
+                "test fixture runtime settings",
+            ),
+        ] {
+            let mut refused = base.clone();
+            refused.insert(key.to_owned(), value.to_owned());
+            assert_eq!(entries(), 0, "{key}");
+            match FixtureFiles::write_with(refused, None, &parent) {
+                Err(ServiceError::Initialization(step)) => assert_eq!(step, refusal, "{key}"),
+                Err(other) => panic!("{key}: {other:?}"),
+                Ok(_) => panic!("{key}: fixture from refused settings"),
+            }
+            assert_eq!(entries(), 0, "{key} left files behind");
+        }
+
         // The complete keys write one fixture root there, and dropping the fixture removes it.
         let fixture = FixtureFiles::write_with(base, None, &parent).expect("fixture");
         assert_eq!(entries(), 1);
@@ -1920,6 +1986,212 @@ mod tests {
             failed.map(|error| error.to_string()).as_deref(),
             Some("service initialization failed: database connection")
         );
+    }
+
+    /// Step 1's query, which `docchain-migrate` also runs as its schema check.
+    const SCHEMA_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = $1)";
+
+    /// Sessions a [`CuttingRelay`] accepted and cut.
+    #[derive(Default)]
+    struct RelayCounts {
+        cuts: AtomicUsize,
+        accepted_after_cut: AtomicUsize,
+    }
+
+    /// A loopback TCP relay to the fixture's database server. It closes a session, without
+    /// forwarding the chunk, at the first client bytes that hold one exact statement text, as a
+    /// lost connection would end that query. It keeps no relayed byte beyond its match window
+    /// and prints none. Dropping it ends every session it relays.
+    struct CuttingRelay {
+        port: u16,
+        counts: Arc<RelayCounts>,
+        accept: tokio::task::JoinHandle<()>,
+    }
+
+    impl CuttingRelay {
+        async fn start(host: &str, port: u16, statement: &'static str) -> Self {
+            assert!(!host.starts_with('/'), "the database host is a TCP host");
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("relay listener");
+            let local = listener.local_addr().expect("relay address").port();
+            let counts = Arc::new(RelayCounts::default());
+            let upstream = (host.to_owned(), port);
+            let accept = tokio::spawn({
+                let counts = Arc::clone(&counts);
+                async move {
+                    // Aborting this task drops the set, which aborts every session.
+                    let mut sessions = tokio::task::JoinSet::new();
+                    while let Ok((client, _)) = listener.accept().await {
+                        if counts.cuts.load(Ordering::SeqCst) > 0 {
+                            counts.accepted_after_cut.fetch_add(1, Ordering::SeqCst);
+                        }
+                        sessions.spawn(relay_session(
+                            client,
+                            upstream.clone(),
+                            statement,
+                            Arc::clone(&counts),
+                        ));
+                    }
+                }
+            });
+            Self {
+                port: local,
+                counts,
+                accept,
+            }
+        }
+
+        fn cuts(&self) -> usize {
+            self.counts.cuts.load(Ordering::SeqCst)
+        }
+
+        fn accepted_after_cut(&self) -> usize {
+            self.counts.accepted_after_cut.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for CuttingRelay {
+        fn drop(&mut self) {
+            self.accept.abort();
+        }
+    }
+
+    /// Relays one session both ways until either side closes, or until the client sends
+    /// `statement`, which it drops unforwarded before closing both sockets.
+    async fn relay_session(
+        mut client: TcpStream,
+        upstream: (String, u16),
+        statement: &'static str,
+        counts: Arc<RelayCounts>,
+    ) {
+        let Ok(mut server) = TcpStream::connect((upstream.0.as_str(), upstream.1)).await else {
+            return;
+        };
+        let (mut client_read, mut client_write) = client.split();
+        let (mut server_read, mut server_write) = server.split();
+        let needle = statement.as_bytes();
+        let to_server = async {
+            // The previous chunk's last `needle.len() - 1` bytes, then the new chunk, so a
+            // statement split across reads still matches.
+            let mut window: Vec<u8> = Vec::with_capacity(needle.len() + 8192);
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let read = match client_read.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                window.extend_from_slice(&chunk[..read]);
+                if window
+                    .windows(needle.len())
+                    .any(|candidate| candidate == needle)
+                {
+                    counts.cuts.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+                if server_write.write_all(&chunk[..read]).await.is_err() {
+                    return;
+                }
+                let keep = window.len().min(needle.len() - 1);
+                window.drain(..window.len() - keep);
+            }
+        };
+        let to_client = tokio::io::copy(&mut server_read, &mut client_write);
+        tokio::select! {
+            () = to_server => {}
+            _ = to_client => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_startup_check_query_reports_database_connection() {
+        let database = DatabaseFixture::new().await.expect("schema");
+        database.migrate().await.expect("migrations");
+        let direct = &database.fixture.settings.database;
+        for (check, statement) in [
+            ("schema existence", SCHEMA_EXISTS),
+            ("current schema", "SELECT current_schema()::text"),
+            (
+                "session roles",
+                "SELECT session_user::text, current_user::text",
+            ),
+            (
+                "runtime privilege rule",
+                "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)",
+            ),
+        ] {
+            let relay = CuttingRelay::start(&direct.host, direct.port, statement).await;
+            let mut settings = database.fixture.settings.clone();
+            settings.database.host = "127.0.0.1".to_owned();
+            settings.database.port = relay.port;
+
+            let failed =
+                tokio::time::timeout(Duration::from_secs(10), DocchainService::compose(&settings))
+                    .await
+                    .expect("startup returns within 10 s of the fault")
+                    .err();
+            assert!(
+                matches!(
+                    failed,
+                    Some(ServiceError::Initialization("database connection"))
+                ),
+                "{check}: {failed:?}"
+            );
+            assert_eq!(
+                failed.map(|error| error.to_string()).as_deref(),
+                Some("service initialization failed: database connection"),
+                "{check}"
+            );
+            assert_eq!(relay.cuts(), 1, "{check}");
+            // No later check, and not the lease, opened a session after the fault.
+            assert_eq!(relay.accepted_after_cut(), 0, "{check}");
+            // The document store root is created only after every check passes.
+            assert!(!database.fixture.object_root.exists(), "{check}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_migrator_schema_query_reports_database_connection() {
+        let database = DatabaseFixture::new().await.expect("schema");
+        let direct = &database.fixture.owner;
+        let relay = CuttingRelay::start(&direct.host, direct.port, SCHEMA_EXISTS).await;
+        let mut owner = direct.clone();
+        owner.host = "127.0.0.1".to_owned();
+        owner.port = relay.port;
+
+        let failed = tokio::time::timeout(Duration::from_secs(10), crate::migrator::run(&owner))
+            .await
+            .expect("migration returns within 10 s of the fault")
+            .err();
+        assert_eq!(
+            failed.map(|step| step.to_string()).as_deref(),
+            Some("database connection")
+        );
+        assert_eq!(relay.cuts(), 1);
+        assert_eq!(relay.accepted_after_cut(), 0);
+        let ledger: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("{}._sqlx_migrations", database.schema()))
+            .fetch_one(&database.owner)
+            .await
+            .expect("ledger lookup");
+        assert!(!ledger, "no migration was applied");
+    }
+
+    #[tokio::test]
+    async fn the_migrator_refuses_an_absent_schema() {
+        let fixture = FixtureFiles::write().expect("fixture");
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::migrator::run(&fixture.owner),
+        )
+        .await
+        .expect("migration returns within 10 s")
+        .err();
+        assert_eq!(
+            refused.map(|step| step.to_string()).as_deref(),
+            Some("database schema")
+        );
+        assert_eq!(fixture.schema_exists().await.ok(), Some(false));
     }
 
     #[tokio::test]

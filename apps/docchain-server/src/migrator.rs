@@ -23,8 +23,9 @@ pub struct MigrateError(&'static str);
 ///
 /// # Errors
 ///
-/// [`MigrateError`] naming the failed step: `database connection`, `database owner role`,
-/// `database schema`, or `database migration`.
+/// [`MigrateError`] naming the failed step: `database connection` when it cannot connect or
+/// its schema query fails, `database owner role`, `database schema` when the schema is absent,
+/// or `database migration`.
 pub async fn run(settings: &MigrationSettings) -> Result<(), MigrateError> {
     let pool = PgPoolOptions::new()
         .max_connections(2)
@@ -40,11 +41,11 @@ pub async fn run(settings: &MigrationSettings) -> Result<(), MigrateError> {
     if session_is_superuser(&mut conn).await {
         return Err(MigrateError("database owner role"));
     }
-    if !matches!(
-        schema_exists(&mut conn, settings.schema.as_str()).await,
-        Ok(true)
-    ) {
-        return Err(MigrateError("database schema"));
+    match schema_exists(&mut conn, settings.schema.as_str()).await {
+        Ok(true) => {}
+        Ok(false) => return Err(MigrateError("database schema")),
+        // A failed query observes nothing about the schema.
+        Err(_) => return Err(MigrateError("database connection")),
     }
     let migrated = migrate_schema(&mut conn)
         .await

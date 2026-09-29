@@ -83,7 +83,7 @@ To run the HTTP service, first bring the schema up to date with `just migrate` (
 order, that the schema exists, that every embedded migration is applied unchanged, that the
 connection's schema is `DOCCHAIN_DATABASE__SCHEMA`, and that its role holds exactly the runtime
 privileges below; otherwise it exits nonzero with one of `database connection` (it cannot connect,
-or a query of the migration state fails), `database schema`, `database migrations pending`,
+or a query of a startup check fails), `database schema`, `database migrations pending`,
 `database migrations mismatch`, or `database role privileges`, and never names a user, password,
 path, or which privilege failed. `database migrations pending` means that an embedded migration is
 not yet applied, or that the server's role cannot use the schema or read the migration ledger, as
@@ -249,9 +249,10 @@ DOCCHAIN_MIGRATION__PASSWORD_FILE=/run/secrets/docchain_owner_key \
     cargo run -p docchain-server --bin docchain-migrate
 ```
 
-`docchain-migrate` takes no arguments and never reads standard input. It connects as the owner,
-refuses a superuser session (`database owner role`), requires the schema to exist
-(`database schema`), and applies every pending forward migration (`database migration`). It exits
+`docchain-migrate` takes no arguments and never reads standard input. It connects as the owner
+(`database connection` when it cannot connect, or its schema query fails), refuses a superuser
+session (`database owner role`), requires the schema to exist (`database schema`), and applies
+every pending forward migration (`database migration`). It exits
 0 when the schema is current, 1 on a failure, and 2 when given any argument. The migration that
 grants the runtime role refuses to run unless the owner owns the schema and everything in it, the
 schema is not `public`, and the runtime role meets the rules above; a schema created and migrated by
