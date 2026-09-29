@@ -470,9 +470,12 @@ async fn check_database(pool: &sqlx::PgPool, schema: &str) -> Result<(), Service
         Ok(MigrationState::Mismatch) => {
             return Err(ServiceError::Initialization("database migrations mismatch"));
         }
-        Ok(MigrationState::Pending) | Err(_) => {
+        Ok(MigrationState::Pending) => {
             return Err(ServiceError::Initialization("database migrations pending"));
         }
+        // A missing or unreadable ledger is already `Pending`; a failed read is a fault of the
+        // connection, not a schema that needs migrating.
+        Err(_) => return Err(ServiceError::Initialization("database connection")),
     }
     let current_schema: Option<String> = sqlx::query_scalar("SELECT current_schema()::text")
         .fetch_one(&mut *conn)
@@ -559,20 +562,23 @@ impl FixtureFiles {
     /// Writes the fixture files under a new temporary root and builds settings naming a new,
     /// not yet created, schema, from the process environment.
     pub(crate) fn write() -> Result<Self, ServiceError> {
-        Self::write_with(process_environment(), None)
+        Self::write_with(process_environment(), None, &std::env::temp_dir())
     }
 
     /// As [`FixtureFiles::write`], from the `base` environment, and, with `revocation_from`,
     /// appending one authority-signed revocation of the recipient's encryption key, at the next
     /// registry sequence, that takes effect at that time.
     ///
+    /// The fixture root is a new directory in `parent`.
+    ///
     /// The runtime credential comes from the `DOCCHAIN_DATABASE__*` keys and the owner
     /// credential from the `DOCCHAIN_MIGRATION__*` keys; a missing key fails the fixture and
-    /// names the key. No `DOCCHAIN_MIGRATION__*` key reaches the server settings or the server
-    /// environment.
+    /// names the key before anything is written. No `DOCCHAIN_MIGRATION__*` key reaches the
+    /// server settings or the server environment.
     fn write_with(
         base: std::collections::HashMap<String, String>,
         revocation_from: Option<&str>,
+        parent: &std::path::Path,
     ) -> Result<Self, ServiceError> {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         use serde_json::{Value, json};
@@ -581,10 +587,34 @@ impl FixtureFiles {
             sync::atomic::{AtomicU64, Ordering},
         };
 
+        // Refused before anything is written, so a refused fixture leaves no files behind.
+        let present = |key: &str| base.get(key).is_some_and(|value| !value.is_empty());
+        if !present("DOCCHAIN_DATABASE__USER") {
+            return Err(ServiceError::Initialization(
+                "test fixture requires DOCCHAIN_DATABASE__USER",
+            ));
+        }
+        if !present("DOCCHAIN_DATABASE__PASSWORD") && !present("DOCCHAIN_DATABASE__PASSWORD_FILE") {
+            return Err(ServiceError::Initialization(
+                "test fixture requires DOCCHAIN_DATABASE__PASSWORD_FILE",
+            ));
+        }
+        if !present("DOCCHAIN_MIGRATION__USER") {
+            return Err(ServiceError::Initialization(
+                "test fixture requires DOCCHAIN_MIGRATION__USER",
+            ));
+        }
+        if !present("DOCCHAIN_MIGRATION__PASSWORD") && !present("DOCCHAIN_MIGRATION__PASSWORD_FILE")
+        {
+            return Err(ServiceError::Initialization(
+                "test fixture requires DOCCHAIN_MIGRATION__PASSWORD_FILE",
+            ));
+        }
+
         static INSTANCE: AtomicU64 = AtomicU64::new(1);
         let suffix = INSTANCE.fetch_add(1, Ordering::Relaxed);
         let schema = format!("docchain_test_{}_{}", std::process::id(), suffix);
-        let root = std::env::temp_dir().join(&schema);
+        let root = parent.join(&schema);
         std::fs::create_dir_all(&root).map_err(|_| ServiceError::Initialization("test fixture"))?;
         let fixture: Value =
             serde_json::from_str(include_str!("../../../tests/vectors/envelope-v1.json"))
@@ -701,28 +731,6 @@ impl FixtureFiles {
 
         let object_root = root.join("objects");
         let mut values: HashMap<String, String> = base;
-        let present = |key: &str| values.get(key).is_some_and(|value| !value.is_empty());
-        if !present("DOCCHAIN_DATABASE__USER") {
-            return Err(ServiceError::Initialization(
-                "test fixture requires DOCCHAIN_DATABASE__USER",
-            ));
-        }
-        if !present("DOCCHAIN_DATABASE__PASSWORD") && !present("DOCCHAIN_DATABASE__PASSWORD_FILE") {
-            return Err(ServiceError::Initialization(
-                "test fixture requires DOCCHAIN_DATABASE__PASSWORD_FILE",
-            ));
-        }
-        if !present("DOCCHAIN_MIGRATION__USER") {
-            return Err(ServiceError::Initialization(
-                "test fixture requires DOCCHAIN_MIGRATION__USER",
-            ));
-        }
-        if !present("DOCCHAIN_MIGRATION__PASSWORD") && !present("DOCCHAIN_MIGRATION__PASSWORD_FILE")
-        {
-            return Err(ServiceError::Initialization(
-                "test fixture requires DOCCHAIN_MIGRATION__PASSWORD_FILE",
-            ));
-        }
         for (key, value) in [
             ("DOCCHAIN_DATABASE__SCHEMA", schema.clone()),
             (
@@ -915,6 +923,38 @@ async fn schema_exists_as(options: PgConnectOptions, schema: &str) -> Result<boo
     exists
 }
 
+/// Polls `pg_locks` from `observer`, every 20 ms for at most 10 s, until a session waits for
+/// an ACCESS SHARE lock on `relation`, a schema-qualified table, and returns that session's pid.
+/// The observed row is the synchronization; the interval only paces the reads.
+///
+/// # Panics
+///
+/// When no session waits on `relation` within 10 s, or the catalog read fails.
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) async fn access_share_waiter(observer: &sqlx::PgPool, relation: &str) -> i32 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiter: Option<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_locks WHERE locktype = 'relation' \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+             AND relation = to_regclass($1) AND mode = 'AccessShareLock' AND NOT granted \
+             ORDER BY pid LIMIT 1",
+        )
+        .bind(relation)
+        .fetch_optional(observer)
+        .await
+        .expect("lock waits");
+        if let Some(pid) = waiter {
+            return pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no session waited on {relation} within 10 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 #[cfg(feature = "test-support")]
 impl Drop for FixtureFiles {
     fn drop(&mut self) {
@@ -1062,7 +1102,11 @@ impl DemoHarness {
     /// `2099-01-01T00:00:00Z`.
     pub async fn with_scheduled_revocation() -> Result<Self, ServiceError> {
         Self::compose_fixture(
-            FixtureFiles::write_with(process_environment(), Some("2099-01-01T00:00:00Z"))?,
+            FixtureFiles::write_with(
+                process_environment(),
+                Some("2099-01-01T00:00:00Z"),
+                &std::env::temp_dir(),
+            )?,
             Limits::default(),
         )
         .await
@@ -1679,18 +1723,15 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn server_environments_never_carry_migration_owner_keys() {
-        let secrets = std::env::temp_dir().join(format!(
-            "docchain_harness_environment_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&secrets).expect("secret directory");
+    /// Writes invented password files into `secrets` and returns the four credential keys
+    /// that name them.
+    fn invented_credentials(secrets: &std::path::Path) -> HashMap<String, String> {
+        std::fs::create_dir_all(secrets).expect("secret directory");
         let runtime_file = secrets.join("runtime");
         let owner_file = secrets.join("owner");
         std::fs::write(&runtime_file, "invented-runtime-password").expect("runtime file");
         std::fs::write(&owner_file, "invented-owner-password").expect("owner file");
-        let base: HashMap<String, String> = [
+        [
             ("DOCCHAIN_DATABASE__USER", "docchain_runtime".to_owned()),
             (
                 "DOCCHAIN_DATABASE__PASSWORD_FILE",
@@ -1704,9 +1745,18 @@ mod tests {
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
-        .collect();
+        .collect()
+    }
 
-        let fixture = FixtureFiles::write_with(base.clone(), None).expect("fixture");
+    #[test]
+    fn server_environments_never_carry_migration_owner_keys() {
+        let secrets = std::env::temp_dir().join(format!(
+            "docchain_harness_environment_{}",
+            std::process::id()
+        ));
+        let base = invented_credentials(&secrets);
+
+        let fixture = FixtureFiles::write_with(base, None, &std::env::temp_dir()).expect("fixture");
         // The in-process settings refuse any owner key, so building them proves its absence.
         assert!(
             fixture
@@ -1730,8 +1780,24 @@ mod tests {
                 .any(|(key, _)| key == "DOCCHAIN_MIGRATION__PASSWORD_FILE")
         );
         drop(fixture);
+        std::fs::remove_dir_all(secrets).expect("remove secrets");
+    }
 
-        // Each missing credential key fails the fixture, naming the key.
+    #[test]
+    fn refused_fixtures_leave_nothing_behind() {
+        let secrets = std::env::temp_dir().join(format!(
+            "docchain_harness_refusal_secrets_{}",
+            std::process::id()
+        ));
+        let base = invented_credentials(&secrets);
+        // A directory of this test's own: the shared temporary directory also holds the
+        // fixtures of tests running in parallel.
+        let parent =
+            std::env::temp_dir().join(format!("docchain_harness_refusals_{}", std::process::id()));
+        std::fs::create_dir_all(&parent).expect("fixture parent");
+        let entries = || std::fs::read_dir(&parent).expect("fixture parent").count();
+
+        // Each missing credential key fails the fixture, naming the key, and writes nothing.
         for key in [
             "DOCCHAIN_DATABASE__USER",
             "DOCCHAIN_DATABASE__PASSWORD_FILE",
@@ -1740,13 +1806,105 @@ mod tests {
         ] {
             let mut incomplete = base.clone();
             incomplete.remove(key);
-            match FixtureFiles::write_with(incomplete, None) {
-                Err(ServiceError::Initialization(step)) => assert!(step.ends_with(key), "{key}"),
+            assert_eq!(entries(), 0, "{key}");
+            match FixtureFiles::write_with(incomplete, None, &parent) {
+                Err(ServiceError::Initialization(step)) => {
+                    assert_eq!(step, format!("test fixture requires {key}"));
+                }
                 Err(other) => panic!("{key}: {other:?}"),
                 Ok(_) => panic!("{key}: fixture without the key"),
             }
+            assert_eq!(entries(), 0, "{key} left files behind");
         }
+
+        // The complete keys write one fixture root there, and dropping the fixture removes it.
+        let fixture = FixtureFiles::write_with(base, None, &parent).expect("fixture");
+        assert_eq!(entries(), 1);
+        drop(fixture);
+        assert_eq!(entries(), 0);
+        std::fs::remove_dir(parent).expect("remove fixture parent");
         std::fs::remove_dir_all(secrets).expect("remove secrets");
+    }
+
+    #[tokio::test]
+    async fn startup_reports_pending_and_mismatched_migrations() {
+        let database = DatabaseFixture::new().await.expect("schema");
+        let settings = &database.fixture.settings;
+        let unmigrated = DocchainService::compose(settings).await.err();
+        assert!(
+            matches!(
+                unmigrated,
+                Some(ServiceError::Initialization("database migrations pending"))
+            ),
+            "{unmigrated:?}"
+        );
+
+        database.migrate().await.expect("migrations");
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 2")
+            .bind(vec![0_u8; 48])
+            .execute(&database.owner)
+            .await
+            .expect("tamper with the recorded checksum");
+        let changed = DocchainService::compose(settings).await.err();
+        assert!(
+            matches!(
+                changed,
+                Some(ServiceError::Initialization("database migrations mismatch"))
+            ),
+            "{changed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_migration_state_read_reports_database_connection() {
+        let database = DatabaseFixture::new().await.expect("schema");
+        database.migrate().await.expect("migrations");
+        // Taken out of the pool, so any failure closes the session and releases the lock.
+        let mut holder = database.owner.acquire().await.expect("holder").detach();
+        sqlx::raw_sql("BEGIN; LOCK TABLE _sqlx_migrations IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut holder)
+            .await
+            .expect("lock the migration ledger");
+
+        // Only the migration-state read touches the ledger; the schema check reads a catalog.
+        let startup = DocchainService::compose(&database.fixture.settings);
+        tokio::pin!(startup);
+        let ledger = format!("{}._sqlx_migrations", database.schema());
+        let waiter = tokio::select! {
+            biased;
+            returned = &mut startup => {
+                panic!("startup ended while the ledger was locked: {:?}", returned.err())
+            }
+            waiter = access_share_waiter(&database.owner, &ledger) => waiter,
+        };
+        // Another session of the runtime role ends the waiting read, as a lost connection
+        // would.
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(waiter)
+            .fetch_one(&database.runtime)
+            .await
+            .expect("terminate the waiting session");
+        assert!(terminated, "the runtime role ends its own role's session");
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut holder)
+            .await
+            .expect("release the ledger");
+
+        let failed = tokio::time::timeout(Duration::from_secs(10), startup)
+            .await
+            .expect("startup returns within 10 s of the fault")
+            .err();
+        assert!(
+            matches!(
+                failed,
+                Some(ServiceError::Initialization("database connection"))
+            ),
+            "{failed:?}"
+        );
+        assert_eq!(
+            failed.map(|error| error.to_string()).as_deref(),
+            Some("service initialization failed: database connection")
+        );
     }
 
     #[tokio::test]

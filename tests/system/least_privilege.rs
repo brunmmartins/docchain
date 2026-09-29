@@ -436,7 +436,16 @@ async fn runtime_role_cannot_weaken_integrity() {
     }
 
     // A temporary table shadowing the ledger does not hide an unbalanced credit from the
-    // balance trigger: COMMIT is refused. The table is dropped at commit in any case.
+    // balance trigger. While the runtime role holds TEMPORARY, COMMIT is refused; once the
+    // platform revokes it, CREATE is. The table is dropped at commit in any case.
+    let temporary: bool =
+        sqlx::query_scalar("SELECT has_database_privilege($1, current_database(), 'TEMPORARY')")
+            .bind(harness.database().runtime_role())
+            .fetch_one(owner)
+            .await
+            .expect("temporary privilege");
+    let expected = if temporary { "23514" } else { "42501" };
+    println!("runtime role TEMPORARY on the database: {temporary}; shadowing expects {expected}");
     let shadow = format!(
         "CREATE TEMPORARY TABLE credit_entries \
              (eligibility_key TEXT, account_id TEXT, amount BIGINT) ON COMMIT DROP; \
@@ -448,7 +457,7 @@ async fn runtime_role_cannot_weaken_integrity() {
     );
     assert_eq!(
         harness.sqlstate_as_runtime(&shadow, true).await,
-        Err("23514".to_owned())
+        Err(expected.to_owned())
     );
 
     assert_eq!(row_counts(owner).await, before);
@@ -488,8 +497,14 @@ fn spawn(binary: &str, environment: &[(String, String)]) -> Child {
 }
 
 /// Waits up to thirty seconds for the process to exit; returns its status and output. The
-/// process must not have become ready at `address` meanwhile.
-async fn exit_before_ready(mut child: Child, address: Option<SocketAddr>) -> (ExitStatus, String) {
+/// process must not have become ready at `address` meanwhile, and its output must reveal no
+/// password file that `screened` names. That check runs before any caller can print the output,
+/// and its own message holds none of it.
+async fn exit_before_ready(
+    mut child: Child,
+    address: Option<SocketAddr>,
+    screened: &[&[(String, String)]],
+) -> (ExitStatus, String) {
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("process status") {
@@ -522,6 +537,10 @@ async fn exit_before_ready(mut child: Child, address: Option<SocketAddr>) -> (Ex
     {
         output.push_str(&pipe);
     }
+    assert!(
+        !reveals_a_password(&output, screened),
+        "the process output revealed a password"
+    );
     (status, output)
 }
 
@@ -533,10 +552,15 @@ fn server_environment(database: &DatabaseFixture) -> (Vec<(String, String)>, Soc
     (environment, address)
 }
 
-/// Starts the server, expects it to exit 1 before readiness, and returns its output.
-async fn refused_start(environment: &[(String, String)], address: SocketAddr) -> String {
+/// Starts the server, expects it to exit 1 before readiness, and returns its output, screened
+/// against the password files that `screened` names.
+async fn refused_start(
+    environment: &[(String, String)],
+    address: SocketAddr,
+    screened: &[&[(String, String)]],
+) -> String {
     let server = spawn(env!("CARGO_BIN_EXE_docchain-server"), environment);
-    let (status, output) = exit_before_ready(server, Some(address)).await;
+    let (status, output) = exit_before_ready(server, Some(address), screened).await;
     assert_eq!(status.code(), Some(1), "{output}");
     output
 }
@@ -589,22 +613,23 @@ async fn ledger(owner: &PgPool) -> Vec<(i64, bool, Vec<u8>)> {
 
 #[tokio::test]
 async fn runtime_role_does_not_migrate() {
-    let mut outputs = Vec::new();
     let database = DatabaseFixture::new()
         .await
         .expect("supplied PostgreSQL and a writable temporary root");
     let owner = database.owner_pool();
     let migration_environment = database.migration_environment();
+    // Every output is screened for either role's password as it is captured.
+    let fixture_environment = database.server_environment();
+    let screened: &[&[(String, String)]] = &[&fixture_environment, &migration_environment];
 
     // (1) A fresh schema: the server refuses before readiness and creates nothing.
     let (environment, address) = server_environment(&database);
-    let output = refused_start(&environment, address).await;
+    let output = refused_start(&environment, address, screened).await;
     assert!(
         output.trim_end().ends_with("database migrations pending"),
         "{output}"
     );
     assert_eq!(relation_count(owner).await, 0);
-    outputs.push(output);
 
     // (2) A migration owner key in the server's environment is refused, naming the key.
     let (mut with_owner_key, address) = server_environment(&database);
@@ -614,9 +639,8 @@ async fn runtime_role_does_not_migrate() {
             .filter(|(key, _)| key.starts_with("DOCCHAIN_MIGRATION__"))
             .cloned(),
     );
-    let output = refused_start(&with_owner_key, address).await;
+    let output = refused_start(&with_owner_key, address, screened).await;
     assert!(output.contains("DOCCHAIN_MIGRATION__"), "{output}");
-    outputs.push(output);
 
     // (4) The migrator, with the owner's environment, brings the schema up to date; the
     // server then becomes ready.
@@ -624,9 +648,8 @@ async fn runtime_role_does_not_migrate() {
         env!("CARGO_BIN_EXE_docchain-migrate"),
         &migration_environment,
     );
-    let (status, output) = exit_before_ready(migrator, None).await;
+    let (status, output) = exit_before_ready(migrator, None, screened).await;
     assert_eq!(status.code(), Some(0), "{output}");
-    outputs.push(output);
     let (environment, address) = server_environment(&database);
     serves(&environment, address).await;
     let migrated = ledger(owner).await;
@@ -663,12 +686,11 @@ async fn runtime_role_does_not_migrate() {
             .await
             .expect("grant");
         let (environment, address) = server_environment(&database);
-        let output = refused_start(&environment, address).await;
+        let output = refused_start(&environment, address, screened).await;
         assert!(
             output.trim_end().ends_with("database role privileges"),
             "{granted}: {output}"
         );
-        outputs.push(output);
         sqlx::raw_sql(sqlx::AssertSqlSafe(revoked))
             .execute(owner)
             .await
@@ -688,22 +710,12 @@ async fn runtime_role_does_not_migrate() {
     let before = ledger(owner).await;
     assert_eq!(before.len(), 5);
     let (environment, address) = server_environment(&database);
-    let output = refused_start(&environment, address).await;
+    let output = refused_start(&environment, address, screened).await;
     assert!(
         output.trim_end().ends_with("database migrations pending"),
         "{output}"
     );
-    outputs.push(output);
     assert_eq!(ledger(owner).await, before);
-
-    // No run printed either role's password.
-    let server_environment = database.server_environment();
-    for output in &outputs {
-        assert!(!reveals_a_password(
-            output,
-            &[&server_environment, &migration_environment]
-        ));
-    }
 }
 
 /// A harness is also a migrated database: its server environment starts a ready server.

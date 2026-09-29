@@ -2784,17 +2784,9 @@ mod tests {
             );
         }
 
-        #[tokio::test]
-        async fn credit_snapshot_groups_the_ledger_within_its_bound() {
-            use crate::providers::AuditKey;
-
-            let (fixture, owner) = migrated().await;
-            let integrity = AuditKey::load(&fixture.root.join("audit.key")).expect("audit key");
-            let store = PgExchangeStore::new(
-                fixture.runtime_pool().await.expect("runtime pool"),
-                fixture.schema.clone(),
-            );
-            let record = |index: u8| ExchangeRecord {
+        /// An invented exchange from wallet 1 to wallet 2, distinct for each `index`.
+        fn exchange_record(index: u8) -> ExchangeRecord {
+            ExchangeRecord {
                 exchange_id: ExchangeId::new(format!(
                     "exc_000000000000000000000000000000{index:02}"
                 ))
@@ -2816,8 +2808,12 @@ mod tests {
                 registry_sequence: 3,
                 committed_at: Timestamp::from_unix_seconds(86_400),
                 accepted: false,
-            };
-            let draft = |record: &ExchangeRecord, kind| EventDraft {
+            }
+        }
+
+        /// The event `record` produces as `kind`.
+        fn event_draft(record: &ExchangeRecord, kind: EventKind) -> EventDraft {
+            EventDraft {
                 kind,
                 exchange_id: record.exchange_id.clone(),
                 object_id: record.object_id.clone(),
@@ -2830,7 +2826,21 @@ mod tests {
                 document_version: record.document_version,
                 registry_sequence: record.registry_sequence,
                 committed_at: record.committed_at,
-            };
+            }
+        }
+
+        #[tokio::test]
+        async fn credit_snapshot_groups_the_ledger_within_its_bound() {
+            use crate::providers::AuditKey;
+
+            let (fixture, owner) = migrated().await;
+            let integrity = AuditKey::load(&fixture.root.join("audit.key")).expect("audit key");
+            let store = PgExchangeStore::new(
+                fixture.runtime_pool().await.expect("runtime pool"),
+                fixture.schema.clone(),
+            );
+            let record = exchange_record;
+            let draft = event_draft;
             let accept = |record: ExchangeRecord, key: &'static str| {
                 let store = &store;
                 let integrity = &integrity;
@@ -2894,10 +2904,8 @@ mod tests {
                 Err(AuditReadError::Exhausted)
             );
 
-            // An acceptance committed after a snapshot is in neither its tail nor its ledger.
+            // A later snapshot includes a later acceptance in both its tail and its ledger.
             accept(record(2), "idem_accept0000000002").await;
-            assert_eq!(read.snapshot.event_count(), 3);
-            assert_eq!(read.transactions.len(), 1);
             let later = store.credit_snapshot(10).await.expect("later ledger");
             assert_eq!(
                 (later.snapshot.event_count(), later.transactions.len()),
@@ -2949,6 +2957,101 @@ mod tests {
             assert_eq!(
                 store.credit_snapshot(2).await.map(|_| ()),
                 Err(AuditReadError::Exhausted)
+            );
+        }
+
+        #[tokio::test]
+        async fn credit_snapshot_excludes_a_credit_committed_while_it_waits() {
+            use crate::providers::AuditKey;
+
+            let (fixture, owner) = migrated().await;
+            let integrity = AuditKey::load(&fixture.root.join("audit.key")).expect("audit key");
+            let store = PgExchangeStore::new(
+                fixture.runtime_pool().await.expect("runtime pool"),
+                fixture.schema.clone(),
+            );
+            let sent = exchange_record(1);
+            store
+                .commit_send(
+                    &sent,
+                    event_draft(&sent, EventKind::Delivered),
+                    &integrity,
+                    100,
+                )
+                .await
+                .expect("send");
+            let before = store.credit_snapshot(10).await.expect("ledger before");
+            assert_eq!(before.snapshot.event_count(), 1);
+            assert!(before.transactions.is_empty());
+
+            // Taken out of the pool, so any failure closes the session and releases the lock.
+            let mut holder = owner.acquire().await.expect("holder").detach();
+            sqlx::raw_sql("BEGIN; LOCK TABLE credit_entries IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut holder)
+                .await
+                .expect("lock the ledger entries");
+
+            // The read takes its snapshot with the tail, then waits for the entries lock.
+            let read = store.credit_snapshot(10);
+            tokio::pin!(read);
+            let entries = format!("{}.credit_entries", fixture.schema);
+            tokio::select! {
+                biased;
+                returned = &mut read => {
+                    panic!("the read returned while the entries were locked: {returned:?}")
+                }
+                _waiter = crate::harness::access_share_waiter(&owner, &entries) => {}
+            }
+
+            let key = docchain_domain::acceptance_eligibility_key(&sent.exchange_id);
+            sqlx::query(
+                "INSERT INTO credit_transactions (eligibility_key, exchange_id) VALUES ($1, $2)",
+            )
+            .bind(&key)
+            .bind(sent.exchange_id.to_string())
+            .execute(&mut holder)
+            .await
+            .expect("credit transaction");
+            sqlx::query(
+                "INSERT INTO credit_entries (eligibility_key, account_id, amount) \
+                 VALUES ($1, 'issuance', -1), ($1, $2, 1)",
+            )
+            .bind(&key)
+            .bind(sent.sender.to_string())
+            .execute(&mut holder)
+            .await
+            .expect("credit entries");
+            sqlx::raw_sql("COMMIT")
+                .execute(&mut holder)
+                .await
+                .expect("commit the credit and release the lock");
+
+            let read = tokio::time::timeout(Duration::from_secs(10), read)
+                .await
+                .expect("the read returns within 10 s of the release")
+                .expect("ledger read while waiting");
+            assert!(read.snapshot == before.snapshot, "the tail moved");
+            assert_eq!(read.transactions, before.transactions);
+
+            // A later snapshot holds that credit, so its absence above is not vacuous.
+            let later = store.credit_snapshot(10).await.expect("ledger after");
+            assert!(later.snapshot == before.snapshot, "the tail moved");
+            assert_eq!(
+                later.transactions,
+                [CreditLedgerTransaction {
+                    eligibility_key: key,
+                    exchange_id: Some(sent.exchange_id.to_string()),
+                    entries: vec![
+                        CreditLedgerEntry {
+                            account: "issuance".to_owned(),
+                            amount: -1,
+                        },
+                        CreditLedgerEntry {
+                            account: sent.sender.to_string(),
+                            amount: 1,
+                        },
+                    ],
+                }]
             );
         }
     }

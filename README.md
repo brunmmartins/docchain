@@ -45,7 +45,7 @@ values are supplied as mounted files. The settings are:
 | `DOCCHAIN_DATABASE__HOST` | `postgres` |
 | `DOCCHAIN_DATABASE__PORT` | `5432` |
 | `DOCCHAIN_DATABASE__NAME` | `docchain` |
-| `DOCCHAIN_DATABASE__USER` | `docchain`; the runtime role. `docchain-migrate` requires it explicitly, as a lower-case PostgreSQL identifier other than the owner |
+| `DOCCHAIN_DATABASE__USER` | `docchain`. Set it to the runtime role the platform provisioned; the default is only a name, not that role. `docchain-migrate` requires it explicitly, as a lower-case PostgreSQL identifier other than the owner |
 | `DOCCHAIN_DATABASE__PASSWORD` | Read from the password file when unset; the server only |
 | `DOCCHAIN_DATABASE__PASSWORD_FILE` | Required when `DOCCHAIN_DATABASE__PASSWORD` is unset; the server only |
 | `DOCCHAIN_DATABASE__MAX_CONNECTIONS` | `10` (accepted range 2 to 64) |
@@ -82,11 +82,15 @@ To run the HTTP service, first bring the schema up to date with `just migrate` (
 `cargo run -p docchain-server`. The server never applies migrations. Before it listens, it checks, in
 order, that the schema exists, that every embedded migration is applied unchanged, that the
 connection's schema is `DOCCHAIN_DATABASE__SCHEMA`, and that its role holds exactly the runtime
-privileges below; otherwise it exits nonzero with one of `database schema`,
-`database migrations pending`, `database migrations mismatch`, or `database role privileges`, and
-never names a user, password, path, or which privilege failed. It then loads its key and identity
-files, takes the document-store lease, and runs the startup sweep described in
-[Document store root](#document-store-root). Standard input is ignored. SIGINT or
+privileges below; otherwise it exits nonzero with one of `database connection` (it cannot connect,
+or a query of the migration state fails), `database schema`, `database migrations pending`,
+`database migrations mismatch`, or `database role privileges`, and never names a user, password,
+path, or which privilege failed. `database migrations pending` means that an embedded migration is
+not yet applied, or that the server's role cannot use the schema or read the migration ledger, as
+when `DOCCHAIN_DATABASE__USER` names a role the migrations did not grant, which `just migrate` alone
+does not fix; a failed query of the migration state reports `database connection`.
+It then loads its key and identity files, takes the document-store lease, and runs the startup
+sweep described in [Document store root](#document-store-root). Standard input is ignored. SIGINT or
 SIGTERM stops intake and drains admitted requests; a complete drain exits zero, while exceeding the
 configured shutdown deadline cancels the remaining requests, which receive `503` with the category
 `dependency-failure` if their connection is still open, and exits nonzero. A cancelled send retried
@@ -207,17 +211,19 @@ startup.
 
 ### Database roles
 
-Docchain uses two PostgreSQL roles, which the platform provisions:
+Docchain uses two PostgreSQL roles. The platform provisions and names both; Docchain applies no
+role name of its own. `docchain-migrate` connects as `DOCCHAIN_MIGRATION__USER`, which has no
+default. The server connects as `DOCCHAIN_DATABASE__USER`, which must name the runtime role.
 
-- The **migration owner** (`docchain_owner` by default) owns the configured schema and every object
-  in it. Only `docchain-migrate` connects as it. It must not be a superuser: `docchain-migrate` and
-  the tests refuse a superuser session. For the tests' disposable schemas it needs CREATE on the
-  database; it does not need CREATEROLE.
-- The **runtime role** (`docchain_runtime` by default) is the only role the server uses. It has LOGIN
-  and CONNECT, no superuser, CREATEROLE, CREATEDB, REPLICATION, or BYPASSRLS attribute, membership
-  in no role, ownership of nothing, no parameter privilege, no CREATE on the database, and no per-role
-  setting. The schema migrations grant it exactly: USAGE on the schema; SELECT on `exchanges`, INSERT
-  on every `exchanges` column except `accepted`, and UPDATE on `accepted` only; SELECT and INSERT on
+- The **migration owner** owns the configured schema and every object in it. Only
+  `docchain-migrate` connects as it. It must not be a superuser: `docchain-migrate` and the tests
+  refuse a superuser session. For the tests' disposable schemas it needs CREATE on the database; it
+  does not need CREATEROLE.
+- The **runtime role** is the only role the server uses. It has LOGIN and CONNECT, no superuser,
+  CREATEROLE, CREATEDB, REPLICATION, or BYPASSRLS attribute, membership in no role, ownership of
+  nothing, no parameter privilege, no CREATE on the database, and no per-role setting. The schema
+  migrations grant it exactly: USAGE on the schema; SELECT on `exchanges`, INSERT on every
+  `exchanges` column except `accepted`, and UPDATE on `accepted` only; SELECT and INSERT on
   `audit_events`, `credit_transactions`, and `credit_entries`; INSERT on `acceptances`; SELECT on
   `_sqlx_migrations`; and nothing else, no sequence or function privilege and no grant option. It
   therefore cannot drop, disable, or bypass a trigger, alter, truncate, or rewrite a table, record a
@@ -230,7 +236,7 @@ the container sets only the server's keys: `DOCCHAIN_DATABASE__USER` and
 `DOCCHAIN_DATABASE__SCHEMA` naming the project's schema. No `DOCCHAIN_MIGRATION__` variable belongs
 there. `just migrate`, `just test`, and `just demo-first-slice` set the owner's keys on their own
 commands only, from the `justfile` variables `migration_owner` and
-`migration_owner_password_file`. Without `just`:
+`migration_owner_password_file`. Without `just`, for example:
 
 ```bash
 DOCCHAIN_MIGRATION__USER=docchain_owner \
